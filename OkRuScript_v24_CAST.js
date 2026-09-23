@@ -1,5 +1,5 @@
 /*
- * GrayJay - OK.ru Source v24
+ * GrayJay - OK.ru Source v25
  *
  * OK.ru público:
  *  - NO usa cookies incrustadas
@@ -13,6 +13,10 @@
  *  - Sin player pages como fuentes
  *  - Buscador multi-endpoint + enriquecimiento de carátulas
  *  - HLS OKCDN sin exigir extensión .m3u8
+ *
+ * v25: metadata anidada (flashvars.metadata string / movie.title /
+ *      movie.poster / movie.duration), MP4 con calidad real primero,
+ *      carátulas genéricas descartadas.
  *
  * Compatible con ES5.
  */
@@ -347,6 +351,117 @@ function tryParseJson(value) {
     return null;
 }
 
+var OK_HEIGHT = {
+    "ultra": 2160,
+    "quad": 1440,
+    "full": 1080,
+    "hd": 720,
+    "sd": 480,
+    "low": 360,
+    "lowest": 240,
+    "mobile": 144
+};
+
+function metaMovie(meta) {
+    try {
+        if (safeObj(meta) && safeObj(meta.movie)) {
+            return meta.movie;
+        }
+    } catch (_) {}
+
+    return null;
+}
+
+/* OK.ru pone: See video "TÍTULO" on OK. Video Player */
+function stripOkTitle(t) {
+    t = cleanText(t);
+
+    var m = t.match(
+        /^See video\s+["\u201c\u00ab]?(.+?)["\u201d\u00bb]?\s+on OK\b.*$/i
+    );
+
+    return m ? m[1].trim() : t;
+}
+
+function isGenericPoster(u) {
+    u = safeStr(u);
+
+    if (!u) return true;
+
+    if (/\.(?:svg|ico)(?:$|[?#])/i.test(u)) {
+        return true;
+    }
+
+    return /(?:logo|favicon|apple-touch|\/static\/)/i.test(u);
+}
+
+function isMetaObject(m) {
+    return !!(
+        safeObj(m) &&
+        (
+            m.movie ||
+            m.videos ||
+            m.hlsManifestUrl ||
+            m.hlsMasterPlaylistUrl ||
+            m.ondemandHls
+        )
+    );
+}
+
+/*
+ * data-options = { flashvars: { metadata: "<JSON en string>",
+ *                               metadataUrl: "..." }, ... }
+ * La metadata real (movie.title, movie.poster, videos[], hls...)
+ * viene como STRING JSON dentro de flashvars, o hay que bajarla de
+ * metadataUrl.
+ */
+function metaFromOptions(opt, pageUrl) {
+    if (!safeObj(opt)) return null;
+
+    var fv = safeObj(opt.flashvars) ? opt.flashvars : opt;
+    var m = null;
+
+    try {
+        m = fv.metadata;
+    } catch (_) {}
+
+    if (typeof m === "string") {
+        m = tryParseJson(m);
+    }
+
+    if (isMetaObject(m)) {
+        return m;
+    }
+
+    var mu = "";
+
+    try {
+        mu = fv.metadataUrl || fv.metadataURL || "";
+    } catch (_) {}
+
+    if (mu) {
+        var url = normalizeUrl(mu, pageUrl);
+
+        if (isHttpUrl(url)) {
+            logDebug("metadataUrl: " + url);
+
+            var body = httpGet(url, pageUrl);
+
+            if (!body) {
+                body = httpGetMobile(url, pageUrl);
+            }
+
+            var obj = tryParseJson(body);
+
+            if (isMetaObject(obj)) {
+                return obj;
+            }
+        }
+    }
+
+    return null;
+}
+
 function extractVideoId(url) {
     var m = safeStr(url).match(
         REGEX_VIDEO_URL
@@ -606,35 +721,37 @@ function fetchMetadataUrl(meta, pageUrl) {
     return null;
 }
 
+
 function parseMetadata(html, pageUrl) {
-    var meta =
-        extractMetadata(html);
+    var opts = extractDataOptions(html);
+
+    for (var o = 0; o < opts.length; o++) {
+        var direct = metaFromOptions(opts[o], pageUrl);
+
+        if (direct) {
+            logDebug("meta OK (data-options)");
+            return direct;
+        }
+    }
+
+    logDebug("data-options sin metadata, uso fallback");
+
+    var meta = extractMetadata(html);
 
     if (!meta) {
         return null;
     }
 
-    /*
-     * Si ya tenemos HLS o videos[] no necesitamos
-     * otra petición.
-     */
     if (
         meta.hlsManifestUrl ||
         meta.hlsMasterPlaylistUrl ||
         meta.ondemandHls ||
-        (
-            Array.isArray(meta.videos) &&
-            meta.videos.length
-        )
+        (Array.isArray(meta.videos) && meta.videos.length)
     ) {
         return meta;
     }
 
-    var fetched =
-        fetchMetadataUrl(
-            meta,
-            pageUrl
-        );
+    var fetched = fetchMetadataUrl(meta, pageUrl);
 
     return fetched || meta;
 }
@@ -688,44 +805,53 @@ function addUniqueSource(
     }
 }
 
+
 function getDuration(meta) {
-    var v = firstValue(
-        meta,
-        [
-            "duration",
-            "durationMs",
-            "durationSec",
-            "length",
-            "videoDuration"
-        ]
+    /* movie.duration viene en SEGUNDOS */
+    var s = parseFloat(
+        firstValue(metaMovie(meta), ["duration"])
     );
 
-    var n = parseFloat(v);
+    if (isFinite(s) && s > 0) {
+        return Math.round(s);
+    }
 
-    if (!isFinite(n) || n <= 0) {
+    var ms = parseFloat(
+        firstValue(meta, ["durationMs"])
+    );
+
+    if (isFinite(ms) && ms > 0) {
+        return Math.round(ms / 1000);
+    }
+
+    var v = parseFloat(
+        firstValue(
+            meta,
+            ["duration", "durationSec", "length", "videoDuration"]
+        )
+    );
+
+    if (!isFinite(v) || v <= 0) {
         return 0;
     }
 
-    if (n > 1000) {
-        n = n / 1000;
+    if (v > 200000) {
+        v = v / 1000;
     }
 
-    return Math.round(n);
+    return Math.round(v);
 }
 
-function getTitle(meta, html, id) {
-    var title = firstValue(
-        meta,
-        [
-            "title",
-            "name",
-            "movieTitle",
-            "videoTitle",
-            "caption"
-        ]
-    );
 
-    title = cleanText(title);
+function getTitle(meta, html, id) {
+    var title =
+        firstValue(metaMovie(meta), ["title", "name"]) ||
+        firstValue(
+            meta,
+            ["title", "name", "movieTitle", "videoTitle", "caption"]
+        );
+
+    title = stripOkTitle(title);
 
     if (
         !title ||
@@ -742,7 +868,7 @@ function getTitle(meta, html, id) {
             );
 
         if (m) {
-            title = cleanText(m[1]);
+            title = stripOkTitle(m[1]);
         }
     }
 
@@ -753,49 +879,64 @@ function getTitle(meta, html, id) {
             );
 
         if (m) {
-            title = cleanText(m[1])
-                .replace(
-                    /\s*[|\-–]\s*OK\.?RU.*$/i,
-                    ""
-                )
+            title = stripOkTitle(m[1])
+                .replace(/\s*[|\-\u2013]\s*OK\.?RU.*$/i, "")
                 .trim();
         }
     }
 
-    return (
-        title ||
-        "OK.ru video " + id
-    );
+    return title || "OK.ru video " + id;
 }
 
+
 function getPoster(meta, html) {
-    var poster = firstValue(
-        meta,
-        [
-            "poster",
-            "posterUrl",
-            "thumbnail",
-            "thumbnailUrl",
-            "cover",
-            "coverUrl",
-            "image",
-            "imageUrl",
-            "preview"
-        ]
-    );
+    var keys = [
+        "poster",
+        "posterUrl",
+        "thumbnail",
+        "thumbnailUrl",
+        "big",
+        "cover",
+        "coverUrl",
+        "image",
+        "imageUrl",
+        "preview"
+    ];
+
+    var poster =
+        firstValue(metaMovie(meta), keys) ||
+        firstValue(meta, keys);
 
     if (poster) {
-        return normalizeUrl(poster);
+        poster = normalizeUrl(poster);
+
+        if (isHttpUrl(poster) && !isGenericPoster(poster)) {
+            return poster;
+        }
     }
 
+    /*
+     * og:image solo si parece una vista previa real de video
+     * (getVideoPreview / okcdn). Si no, es el logo de OK.ru.
+     */
     var m =
         safeStr(html).match(
             /property=["']og:image["'][^>]+content=["']([^"']+)["']/i
         );
 
-    return m
-        ? normalizeUrl(m[1])
-        : "";
+    if (m) {
+        var og = normalizeUrl(m[1]);
+
+        if (
+            isHttpUrl(og) &&
+            !isGenericPoster(og) &&
+            /getVideoPreview|okcdn\./i.test(og)
+        ) {
+            return og;
+        }
+    }
+
+    return "";
 }
 
 function collectHls(meta) {
@@ -848,8 +989,10 @@ function collectHls(meta) {
     return out;
 }
 
+
 function collectVideos(meta) {
     var out = [];
+    var seen = {};
 
     if (!safeObj(meta)) {
         return out;
@@ -863,10 +1006,6 @@ function collectVideos(meta) {
         vids.push(meta.videos);
     }
 
-    /*
-     * Variantes de metadata donde OK.ru coloca un solo video
-     * o las fuentes bajo video/sources/streams.
-     */
     var directObjects = [
         meta.video,
         meta.movie,
@@ -906,11 +1045,7 @@ function collectVideos(meta) {
         }
     );
 
-    for (
-        var i = 0;
-        i < vids.length;
-        i++
-    ) {
+    for (var i = 0; i < vids.length; i++) {
         if (!safeObj(vids[i])) {
             continue;
         }
@@ -924,11 +1059,19 @@ function collectVideos(meta) {
         ];
 
         for (var c = 0; c < candidates.length; c++) {
-            if (candidates[c]) {
-                addUniqueSource(
-                    out,
-                    candidates[c]
-                );
+            if (!candidates[c]) continue;
+
+            var u = normalizeUrl(candidates[c]);
+
+            if (!isHttpUrl(u) || seen[u]) continue;
+
+            seen[u] = true;
+
+            if (out.length < MAX_SOURCES) {
+                out.push({
+                    url: u,
+                    name: safeStr(vids[i].name).toLowerCase()
+                });
             }
         }
     }
@@ -951,119 +1094,71 @@ function makeHlsSource(
     return null;
 }
 
-function makeMp4Source(
-    url,
-    duration,
-    label,
-    index
-) {
+
+function makeMp4Source(item, duration) {
     try {
-        var name =
-            "OK.ru " +
-            (label || "MP4");
+        var q = safeStr(item.name).toLowerCase();
+        var h = OK_HEIGHT[q] || 0;
+        var w = h ? Math.round(h * 16 / 9) : 0;
 
         return new VideoUrlSource({
-            width: 0,
-            height: 0,
-            container: "mp4",
+            width: w,
+            height: h,
+            container: "video/mp4",
             codec: "",
-            name: name,
+            name: OK_LABEL[q] || "MP4",
             bitrate: 0,
             duration: duration || 0,
-            url: normalizeUrl(url)
+            url: item.url
         });
     } catch (_) {}
 
     return null;
 }
 
-function buildDetails(
-    meta,
-    pageUrl,
-    html
-) {
-    var id =
-        extractVideoId(pageUrl);
 
-    var title =
-        getTitle(
-            meta,
-            html,
-            id
-        );
+function buildDetails(meta, pageUrl, html) {
+    var id = extractVideoId(pageUrl);
+    var title = getTitle(meta, html, id);
+    var poster = getPoster(meta, html);
+    var duration = getDuration(meta);
+    var hls = collectHls(meta);
+    var mp4 = collectVideos(meta);
 
-    var poster =
-        getPoster(
-            meta,
-            html
-        );
-
-    var duration =
-        getDuration(meta);
-
-    var hls =
-        collectHls(meta);
-
-    var mp4 =
-        collectVideos(meta);
-
-    logDebug(
-        "OK.ru sources: HLS=" +
-        hls.length +
-        " MP4=" +
-        mp4.length
-    );
+    logDebug("OK.ru sources: HLS=" + hls.length + " MP4=" + mp4.length);
 
     var sources = [];
 
-    /*
-     * HLS primero.
-     */
-    for (
-        var i = 0;
-        i < hls.length &&
-        sources.length < MAX_SOURCES;
-        i++
-    ) {
-        var hs =
-            makeHlsSource(
-                hls[i],
-                duration
-            );
+    /* MP4 progresivo primero (calidad real, el más fiable), HLS después. */
+    for (var j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
+        var ms = makeMp4Source(mp4[j], duration);
 
-        if (hs) {
-            sources.push(hs);
-        }
+        if (ms) sources.push(ms);
     }
 
-    /*
-     * MP4 como fallback.
-     */
-    for (
-        var j = 0;
-        j < mp4.length &&
-        sources.length < MAX_SOURCES;
-        j++
-    ) {
-        var label =
-            "MP4 " + (j + 1);
+    for (var i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
+        var hs = makeHlsSource(hls[i], duration);
 
-        var ms =
-            makeMp4Source(
-                mp4[j],
-                duration,
-                label,
-                j
-            );
-
-        if (ms) {
-            sources.push(ms);
-        }
+        if (hs) sources.push(hs);
     }
 
     if (!sources.length) {
+        var keys = "";
+
+        try {
+            keys = Object.keys(meta).join(",");
+        } catch (_) {}
+
+        var reason = "";
+
+        try {
+            reason = safeStr(meta.error || meta.errorMessage || "");
+        } catch (_) {}
+
         throw new Error(
-            "OK.ru no devolvió una fuente HLS/MP4.\n" +
+            "OK.ru no devolvió una fuente HLS/MP4. " +
+            (reason ? "Motivo: " + reason + ". " : "") +
+            "meta keys: " + keys + "\n" +
             DEBUG.join("\n")
         );
     }
@@ -1072,83 +1167,70 @@ function buildDetails(
 
     if (poster && isHttpUrl(poster)) {
         try {
-            thumbs.push(
-                new Thumbnail(
-                    poster,
-                    0
-                )
-            );
+            thumbs.push(new Thumbnail(poster, 0));
         } catch (_) {}
     }
 
     var thumbnails;
 
     try {
-        thumbnails =
-            new Thumbnails(
-                thumbs
-            );
+        thumbnails = new Thumbnails(thumbs);
     } catch (_) {
-        thumbnails =
-            new Thumbnails([]);
+        thumbnails = new Thumbnails([]);
     }
+
+    var authorName = "OK.ru";
+
+    try {
+        if (safeObj(meta.author) && meta.author.name) {
+            authorName = cleanText(meta.author.name) || "OK.ru";
+        }
+    } catch (_) {}
 
     var author = null;
 
     try {
-        author =
-            new PlatformAuthorLink(
-                new PlatformID(
-                    PLATFORM_NAME,
-                    "",
-                    PLUGIN_ID
-                ),
-                "OK.ru",
-                "https://ok.ru/",
-                "",
-                0
-            );
+        author = new PlatformAuthorLink(
+            new PlatformID(PLATFORM_NAME, "", PLUGIN_ID),
+            authorName,
+            "https://ok.ru/",
+            "",
+            0
+        );
     } catch (_) {}
 
     var descriptor = null;
 
     try {
-        descriptor =
-            new MuxVideoSourceDescriptor({
+        descriptor = new VideoSourceDescriptor(sources);
+    } catch (_) {
+        try {
+            descriptor = new MuxVideoSourceDescriptor({
                 isUnMuxed: false,
                 videoSources: sources
             });
-    } catch (_) {
-        try {
-            descriptor =
-                new VideoSourceDescriptor(
-                    sources
-                );
         } catch (__) {}
     }
 
     if (!descriptor) {
-        throw new Error(
-            "No se pudo crear VideoSourceDescriptor"
-        );
+        throw new Error("No se pudo crear VideoSourceDescriptor");
     }
 
-    var firstHls = null;
+    var firstHls = hls.length ? makeHlsSource(hls[0], duration) : null;
+
+    /* Diagnóstico temporal: qué fuentes encontró el plugin. */
+    var dbg = "[v25] MP4=" + mp4.length + " HLS=" + hls.length;
+
+    if (mp4.length) {
+        dbg += "\nMP4[0] " + mp4[0].name + " " + mp4[0].url.substring(0, 140);
+    }
 
     if (hls.length) {
-        firstHls =
-            makeHlsSource(
-                hls[0],
-                duration
-            );
+        dbg += "\nHLS[0] " + hls[0].substring(0, 140);
     }
 
     return new PlatformVideoDetails({
-        id: new PlatformID(
-            PLATFORM_NAME,
-            id,
-            PLUGIN_ID
-        ),
+        id: new PlatformID(PLATFORM_NAME, id, PLUGIN_ID),
         name: title,
         thumbnails: thumbnails,
         author: author,
@@ -1157,7 +1239,7 @@ function buildDetails(
         duration: duration,
         viewCount: 0,
         isLive: false,
-        description: "",
+        description: dbg,
         video: descriptor,
         dash: null,
         hls: firstHls,
@@ -1202,6 +1284,7 @@ function extractSearchTitle(block) {
     return "";
 }
 
+
 function extractSearchPoster(block) {
     var text = safeStr(block);
 
@@ -1218,7 +1301,7 @@ function extractSearchPoster(block) {
         if (m) {
             var u = normalizeUrl(m[1]);
 
-            if (isHttpUrl(u)) {
+            if (isHttpUrl(u) && !isGenericPoster(u)) {
                 return u;
             }
         }
