@@ -37,7 +37,7 @@ const PLUGIN_ID = "62af0e2f-bfd9-489f-afe1-f66583d2f7d0";
 // desplegado (ver worker.js) y KEY por el mismo valor que pusiste como
 // secret ADMIN_KEY en el Worker.
 const COOKIE_WORKER_URL =
-    "https://okru-cookie.TU-SUBDOMINIO.workers.dev/cookie?key=TU_ADMIN_KEY";
+    "https://okru-cookie-worker.cheito55.workers.dev/cookie?key=LucasOkRu2026SecretoLargo987";
 
 // Fallback de emergencia si el Worker no responde (por ejemplo, recién
 // instalado el plugin y todavía no se cargó ninguna cookie). Se puede dejar
