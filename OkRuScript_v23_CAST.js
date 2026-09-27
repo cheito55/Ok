@@ -985,6 +985,12 @@ function xuperResolve(meta) {
 // en PelisHub (exOkRu) resuelve esto poniéndole Referer/User-Agent/Origin
 // de ok.ru a la fuente (sin cookie), y ahí el cast sí anda. Se porta la
 // misma idea acá.
+// Interruptor de diagnóstico: si al pasar esto a false los videos vuelven
+// a arrancar, confirma que el problema es el requestModifier (algún header
+// que el CDN de OK.ru no tolera en el player nativo). Si sigue sin arrancar
+// en false también, el problema es otra cosa (la URL en sí, la cookie, etc.).
+const ENABLE_SOURCE_HEADERS = true;
+
 function okRequestModifier() {
     let h = {
         "User-Agent": UA_DESKTOP,
@@ -1003,13 +1009,16 @@ function okRequestModifier() {
 
 function makeHlsSource(url, duration) {
     try {
-        return new HLSSource({
+        let opts = {
             name: "OK.ru HLS",
             duration: duration || 0,
-            url: url,
-            requestModifier: okRequestModifier()
-        });
-    } catch (_) {}
+            url: url
+        };
+        if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier();
+        return new HLSSource(opts);
+    } catch (e) {
+        addDebug("makeHlsSource EXCEPTION: " + e);
+    }
 
     return null;
 }
@@ -1023,7 +1032,7 @@ function makeMp4Source(url, duration, index) {
         else if (/\.webm(?:$|[?#])/.test(lower)) container = "webm";
         else if (/\.mov(?:$|[?#])/.test(lower)) container = "mov";
 
-        return new VideoUrlSource({
+        let opts = {
             width: 0,
             height: 0,
             container: container,
@@ -1031,10 +1040,13 @@ function makeMp4Source(url, duration, index) {
             name: "OK.ru " + container.toUpperCase() + " " + (index + 1),
             bitrate: 0,
             duration: duration || 0,
-            url: url,
-            requestModifier: okRequestModifier()
-        });
-    } catch (_) {}
+            url: url
+        };
+        if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier();
+        return new VideoUrlSource(opts);
+    } catch (e) {
+        addDebug("makeMp4Source EXCEPTION: " + e);
+    }
 
     return null;
 }
