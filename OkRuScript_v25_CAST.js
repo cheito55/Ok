@@ -49,10 +49,15 @@ const EMBEDDED_OK_COOKIE_FALLBACK = "";
 let _cachedCookie = null;
 let _cookieFetched = false;
 
+function nowMs() {
+    try { return Date.now(); } catch (_) { return 0; }
+}
+
 function getOkCookie() {
     if (_cookieFetched) return _cachedCookie;
     _cookieFetched = true;
     _cachedCookie = EMBEDDED_OK_COOKIE_FALLBACK;
+    let t0 = nowMs();
 
     try {
         if (COOKIE_WORKER_URL.indexOf("TU-SUBDOMINIO") >= 0) {
@@ -78,6 +83,8 @@ function getOkCookie() {
         }
     } catch (e) {
         addDebug("getOkCookie: " + e);
+    } finally {
+        addDebug("getOkCookie tiempo: " + (nowMs() - t0) + "ms");
     }
 
     return _cachedCookie;
@@ -381,11 +388,14 @@ function loadOkPage(url) {
 
     for (let i = 0; i < attempts.length; i++) {
         try {
+            let t0 = nowMs();
             let body = attempts[i]();
+            let ms = nowMs() - t0;
             if (body && body.length > 300) {
-                addDebug("OK page loaded via attempt " + i);
+                addDebug("OK page loaded via attempt " + i + " (" + ms + "ms, " + body.length + " bytes)");
                 return body;
             }
+            addDebug("attempt " + i + " vacío/corto (" + ms + "ms)");
         } catch (_) {}
     }
 
@@ -598,7 +608,9 @@ function metaHasPlayableSource(meta) {
 }
 
 function parseMetadata(html, pageUrl) {
+    let t0 = nowMs();
     let meta = extractMetadataFromHtml(html);
+    addDebug("extractMetadataFromHtml: " + (nowMs() - t0) + "ms");
 
     if (!meta) return null;
 
@@ -607,7 +619,10 @@ function parseMetadata(html, pageUrl) {
     // lo que ahorra una request y acorta el tiempo hasta que arranca el video.
     if (metaHasPlayableSource(meta)) return meta;
 
+    let t1 = nowMs();
     let fetched = fetchMetadataUrl(meta, pageUrl);
+    addDebug("fetchMetadataUrl: " + (nowMs() - t1) + "ms");
+
     if (fetched) return fetched;
 
     return meta;
@@ -816,7 +831,9 @@ function collectHlsUrls(meta) {
 // de mayor a menor calidad.
 const QUALITY_RANK = {
     "ultra": { height: 2160, order: 100 },
+    "highest": { height: 1440, order: 95 },
     "quad": { height: 1440, order: 90 },
+    "higher": { height: 1080, order: 85 },
     "full": { height: 1080, order: 80 },
     "fullhd": { height: 1080, order: 80 },
     "hd": { height: 720, order: 70 },
@@ -1217,8 +1234,11 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
 
     let mp4 = collectMp4Urls(meta); // [{url, label}], ya ordenado de mayor a menor calidad
 
+    let mp4Labels = [];
+    for (let i = 0; i < mp4.length; i++) mp4Labels.push(mp4[i].label || "?");
     addDebug("sources hls=" + hls.length + " mp4=" + mp4.length +
-        (mp4.length ? " (mejor: " + (mp4[0].label || "?") + ")" : ""));
+        (mp4.length ? " labels=[" + mp4Labels.join(",") + "]" : ""));
+    if (hls.length > 0) addDebug("hls[0] url=" + hls[0]);
 
     let sources = [];
 
@@ -1623,6 +1643,7 @@ function extractPageTitle(html) {
 
 function doDetails(url) {
     resetDebug();
+    let tStart = nowMs();
 
     let id = extractVideoId(url);
     if (!id) throw new Error("Invalid OK.ru video URL");
@@ -1632,7 +1653,9 @@ function doDetails(url) {
 
     addDebug("Video ID: " + id);
 
+    let tLoad = nowMs();
     let html = loadOkPage(canonical);
+    addDebug("loadOkPage TOTAL: " + (nowMs() - tLoad) + "ms");
 
     if (!html) {
         throw new Error("Unable to load OK.ru video page");
@@ -1667,7 +1690,35 @@ function doDetails(url) {
         extractPageTitle(html) ||
         ("OK.ru video " + id);
 
-    return buildVideoDetails(meta, canonical, fallbackTitle, html);
+    let details = buildVideoDetails(meta, canonical, fallbackTitle, html);
+
+    addDebug("doDetails TOTAL: " + (nowMs() - tStart) + "ms");
+
+    // DIAGNÓSTICO TEMPORAL: la descripción no se muestra en la UI de
+    // GrayJay para esta fuente, así que el resumen de tiempos/fuentes se
+    // antepone al TÍTULO (que sí siempre es visible) para poder leerlo sin
+    // logs externos. Sacar este bloque una vez diagnosticado.
+    try {
+        function dline(prefix) {
+            for (let i = 0; i < DEBUG.length; i++) {
+                if (DEBUG[i].indexOf(prefix) === 0) return DEBUG[i];
+            }
+            return "";
+        }
+        let diag = [
+            dline("loadOkPage TOTAL:"),
+            dline("OK page loaded via attempt") || dline("attempt"),
+            dline("extractMetadataFromHtml:"),
+            dline("fetchMetadataUrl:"),
+            dline("sources hls="),
+            dline("hls[0] url="),
+            dline("doDetails TOTAL:")
+        ].filter(function (s) { return s; }).join(" | ");
+
+        details.name = "[DIAG] " + diag + "  ::  " + (details.name || "");
+    } catch (_) {}
+
+    return details;
 }
 
 /* ------------------------- GrayJay bindings ------------------------- */
