@@ -614,16 +614,34 @@ function parseMetadata(html, pageUrl) {
 
     if (!meta) return null;
 
-    // FIX: antes se pedía metadataUrl siempre, aunque el metadata inline
-    // ya tuviera fuentes reproducibles. Ahora solo se pide de más si hace falta,
-    // lo que ahorra una request y acorta el tiempo hasta que arranca el video.
-    if (metaHasPlayableSource(meta)) return meta;
+    let inlineHls = collectHlsUrls(meta).length;
+    let inlineMp4 = collectMp4Urls(meta).length;
+    let hasMetadataUrlField = !!(
+        meta.metadataUrl || meta.metadataURL ||
+        (meta.flashvars && (meta.flashvars.metadataUrl || meta.flashvars.metadataURL))
+    );
+    addDebug("inline meta hls=" + inlineHls + " mp4=" + inlineMp4 +
+        " metadataUrlField=" + (hasMetadataUrlField ? "yes" : "no"));
+
+    // FIX (calidad): antes se saltaba fetchMetadataUrl apenas el inline
+    // metadata tenía UNA fuente jugable, asumiendo que alcanzaba. Pero en
+    // ok.ru esa única fuente suele ser un link de baja calidad para el
+    // primer pintado de la página, mientras que metadataUrl trae la lista
+    // completa de calidades. Ahora solo se saltea si el inline ya parece
+    // "rico" (más de 1 HLS o algún MP4).
+    let looksRich = inlineHls > 1 || inlineMp4 > 0;
+    if (looksRich || !hasMetadataUrlField) return meta;
 
     let t1 = nowMs();
     let fetched = fetchMetadataUrl(meta, pageUrl);
     addDebug("fetchMetadataUrl: " + (nowMs() - t1) + "ms");
 
-    if (fetched) return fetched;
+    if (fetched) {
+        let fHls = collectHlsUrls(fetched).length;
+        let fMp4 = collectMp4Urls(fetched).length;
+        addDebug("fetched meta hls=" + fHls + " mp4=" + fMp4);
+        if (fHls + fMp4 > inlineHls + inlineMp4) return fetched;
+    }
 
     return meta;
 }
@@ -1225,6 +1243,9 @@ function expandHlsVariants(masterUrl) {
     let out = [];
     try {
         let body = fetchTextWithOkHeaders(masterUrl);
+        addDebug("m3u8 fetch: len=" + (body ? body.length : 0) +
+            " preview=" + safeStr(body).substring(0, 90).replace(/[\r\n]+/g, "\\n"));
+
         if (!body || body.indexOf("#EXT-X-STREAM-INF") < 0) {
             addDebug("expandHlsVariants: no es un master playlist (o vacío)");
             return out;
@@ -1844,8 +1865,11 @@ function doDetails(url) {
             dline("loadOkPage TOTAL:"),
             dline("OK page loaded via attempt") || dline("attempt"),
             dline("extractMetadataFromHtml:"),
+            dline("inline meta hls="),
             dline("fetchMetadataUrl:"),
+            dline("fetched meta hls="),
             dline("sources hls="),
+            dline("m3u8 fetch:"),
             dline("hls variantes encontradas:"),
             dline("primary HLS"),
             dline("doDetails TOTAL:")
