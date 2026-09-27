@@ -806,6 +806,67 @@ function collectHlsUrls(meta) {
     return urls;
 }
 
+// FIX (calidad de cast): OK.ru suele exponer varias URLs de video con una
+// etiqueta de calidad (name/type) como "low", "sd", "hd", "full", etc. El
+// código anterior descartaba esa etiqueta y guardaba todas las fuentes con
+// width/height/bitrate en 0, así que GrayJay no tenía ninguna señal para
+// elegir la mejor y terminaba mandando a Cast la primera que encontraba
+// (con frecuencia la de menor calidad). Ahora se mapean las etiquetas
+// conocidas a una resolución/bitrate aproximados y se ordenan las fuentes
+// de mayor a menor calidad.
+const QUALITY_RANK = {
+    "ultra": { height: 2160, order: 100 },
+    "quad": { height: 1440, order: 90 },
+    "full": { height: 1080, order: 80 },
+    "fullhd": { height: 1080, order: 80 },
+    "hd": { height: 720, order: 70 },
+    "hdp": { height: 720, order: 70 },
+    "sd": { height: 480, order: 50 },
+    "sdp": { height: 480, order: 50 },
+    "low": { height: 360, order: 30 },
+    "lq": { height: 360, order: 30 },
+    "lqp": { height: 360, order: 30 },
+    "lowest": { height: 240, order: 10 },
+    "mobile": { height: 144, order: 5 }
+};
+
+function qualityInfo(label) {
+    label = safeStr(label).toLowerCase().trim();
+    return QUALITY_RANK[label] || null;
+}
+
+function estimateBitrate(height) {
+    if (height >= 2160) return 15000000;
+    if (height >= 1440) return 9000000;
+    if (height >= 1080) return 5000000;
+    if (height >= 720) return 2500000;
+    if (height >= 480) return 1200000;
+    if (height >= 360) return 700000;
+    return 400000;
+}
+
+function pushUniqueQuality(arr, url, label) {
+    url = normalizeUrl(url);
+    if (!isHttpUrl(url)) return;
+    for (let i = 0; i < arr.length; i++) {
+        if (arr[i].url === url) return;
+    }
+    if (arr.length >= MAX_SOURCES) return;
+    arr.push({ url: url, label: safeStr(label) });
+}
+
+function sortByQuality(items) {
+    let ranked = items.map(function (item, idx) {
+        let q = qualityInfo(item.label);
+        return { item: item, order: q ? q.order : -1, idx: idx };
+    });
+    ranked.sort(function (a, b) {
+        if (b.order !== a.order) return b.order - a.order;
+        return a.idx - b.idx; // estable para calidades iguales/desconocidas
+    });
+    return ranked.map(function (r) { return r.item; });
+}
+
 function collectMp4Urls(meta) {
     let urls = [];
 
@@ -836,14 +897,15 @@ function collectMp4Urls(meta) {
                 obj.url, obj.src, obj.file,
                 obj.downloadUrl, obj.download_url
             ];
+            let label = safeStr(obj.name || obj.type || obj.kind || obj.quality || "");
             for (let i = 0; i < candidates.length; i++) {
                 let u = normalizeUrl(candidates[i]);
                 if (!isHttpUrl(u)) continue;
                 if (isM3u8Url(u) ||
                     /\.(?:mp4|m4v|mov|webm)(?:$|[?#])/i.test(u) ||
                     isMediaContainer ||
-                    /(?:video|file|media|stream|playlist)/i.test(safeStr(obj.name || obj.type || obj.kind))) {
-                    pushUnique(urls, u);
+                    /(?:video|file|media|stream|playlist)/i.test(label)) {
+                    pushUniqueQuality(urls, u, label);
                 }
             }
         }
@@ -866,8 +928,15 @@ function collectMp4Urls(meta) {
     collectKnown(meta, 0);
 
     // Generic fallback keeps compatibility with other OK.ru metadata shapes.
-    collectMp4UrlsFromObject(meta, urls, 0);
-    return urls;
+    // No trae etiqueta de calidad, así que queda al final del orden salvo
+    // que sortByQuality identifique algo mejor entre las ya etiquetadas.
+    let genericUrls = [];
+    collectMp4UrlsFromObject(meta, genericUrls, 0);
+    for (let i = 0; i < genericUrls.length; i++) {
+        pushUniqueQuality(urls, genericUrls[i], "");
+    }
+
+    return sortByQuality(urls);
 }
 
 function firstValue(obj, keys) {
@@ -1092,7 +1161,7 @@ function makeHlsSource(url, duration) {
     return null;
 }
 
-function makeMp4Source(url, duration, index) {
+function makeMp4Source(url, duration, index, label) {
     try {
         let lower = safeStr(url).toLowerCase();
         let container = "mp4";
@@ -1101,13 +1170,18 @@ function makeMp4Source(url, duration, index) {
         else if (/\.webm(?:$|[?#])/.test(lower)) container = "webm";
         else if (/\.mov(?:$|[?#])/.test(lower)) container = "mov";
 
+        let q = qualityInfo(label);
+        let name = q
+            ? "OK.ru " + label.toUpperCase() + " (" + q.height + "p)"
+            : "OK.ru " + container.toUpperCase() + " " + (index + 1);
+
         let opts = {
-            width: 0,
-            height: 0,
+            width: q ? Math.round(q.height * 16 / 9) : 0,
+            height: q ? q.height : 0,
             container: container,
             codec: "",
-            name: "OK.ru " + container.toUpperCase() + " " + (index + 1),
-            bitrate: 0,
+            name: name,
+            bitrate: q ? estimateBitrate(q.height) : 0,
             duration: duration || 0,
             url: url
         };
@@ -1141,9 +1215,10 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         pushUnique(hls, normalHls[i]);
     }
 
-    let mp4 = collectMp4Urls(meta);
+    let mp4 = collectMp4Urls(meta); // [{url, label}], ya ordenado de mayor a menor calidad
 
-    addDebug("sources hls=" + hls.length + " mp4=" + mp4.length);
+    addDebug("sources hls=" + hls.length + " mp4=" + mp4.length +
+        (mp4.length ? " (mejor: " + (mp4[0].label || "?") + ")" : ""));
 
     let sources = [];
 
@@ -1153,9 +1228,9 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         if (src) sources.push(src);
     }
 
-    // Keep MP4/M4V as a real fallback.
+    // Keep MP4/M4V as a real fallback, de mejor a peor calidad.
     for (let j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
-        let src = makeMp4Source(mp4[j], duration, j);
+        let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
         if (src) sources.push(src);
     }
 
@@ -1222,7 +1297,7 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         firstHls = makeHlsSource(hls[0], duration);
         addDebug("primary HLS: " + hls[0]);
     } else if (mp4.length > 0) {
-        addDebug("primary MP4: " + mp4[0]);
+        addDebug("primary MP4 (" + (mp4[0].label || "?") + "): " + mp4[0].url);
     }
 
     return new PlatformVideoDetails({
@@ -1450,25 +1525,23 @@ function searchOk(query, continuationToken) {
         }
     } catch (_) {}
 
+    // FIX (velocidad): antes se traían 4 páginas (hasta 8 requests con
+    // reintento autenticado/no autenticado) ANTES de devolver el primer
+    // resultado a GrayJay, lo que explicaba el ~1min para "encontrar
+    // videos". Ahora se trae 1 sola página por llamada; GrayJay pide la
+    // siguiente automáticamente vía nextPage() cuando el usuario hace
+    // scroll, así el primer resultado aparece mucho antes.
+    let html = fetchSearchPage(query, page);
+    if (!html) throw new Error("OK.ru search returned no data");
+
+    let found = extractSearchResults(html);
+
     let raw = [];
     let seen = {};
-
-    // Pull several result pages so the source is not limited to the first 24.
-    for (let p = page; p < page + 4 && raw.length < 96; p++) {
-        let html = fetchSearchPage(query, p);
-        if (!html) {
-            if (p === page) throw new Error("OK.ru search returned no data");
-            break;
-        }
-
-        let found = extractSearchResults(html);
-        if (!found.length && p > page) break;
-
-        for (let i = 0; i < found.length && raw.length < 96; i++) {
-            if (!seen[found[i].id]) {
-                seen[found[i].id] = true;
-                raw.push(found[i]);
-            }
+    for (let i = 0; i < found.length; i++) {
+        if (!seen[found[i].id]) {
+            seen[found[i].id] = true;
+            raw.push(found[i]);
         }
     }
 
@@ -1478,10 +1551,12 @@ function searchOk(query, continuationToken) {
         if (v) out.push(v);
     }
 
-    let hasMore = raw.length >= 96;
+    // OK.ru no indica cuál es la última página; mientras la página traiga
+    // resultados asumimos que puede haber más.
+    let hasMore = raw.length > 0;
     let context = {
         query: safeStr(query),
-        page: page + 4
+        page: page + 1
     };
 
     return new OkSearchPager(out, hasMore, context);
