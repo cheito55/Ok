@@ -1195,12 +1195,21 @@ function resolveM3u8Uri(uri, masterUrl) {
 
 function fetchTextWithOkHeaders(url) {
     try {
-        return httpGet(url, {
+        let headers = {
             "User-Agent": UA_DESKTOP,
             "Referer": "https://ok.ru/",
             "Origin": "https://ok.ru",
             "Accept": "*/*"
-        });
+        };
+        let cookie = getOkCookie();
+        if (cookie) headers["Cookie"] = cookie;
+        
+        let r = http.GET(url, headers);
+        if (!r) return "";
+        let body = "";
+        try { body = r.body; } catch (_) {}
+        if (!body) { try { body = r.getBody(); } catch (_) {} }
+        return safeStr(body);
     } catch (_) {
         return "";
     }
@@ -1342,28 +1351,36 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     // de calidades 1440p→144p). O sea que el master que se pasa tal cual ya
     // es correcto; no hacía falta reprocesarlo, y esa llamada solo agregaba
     // latencia sin ningún beneficio. Se volvió a pasar el/los .m3u8 directo.
-    let sources = [];
+        let sources = [];
+    let hlsSourcesAdded = false;
 
-    for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
-        let src = makeHlsSource(hls[i], duration);
-        if (src) sources.push(src);
+    // Intentar extraer las calidades manuales del Master HLS
+    if (hls.length > 0) {
+        let variants = expandHlsVariants(hls[0]);
+        if (variants && variants.length > 0) {
+            for (let v = 0; v < variants.length && sources.length < MAX_SOURCES; v++) {
+                let src = makeHlsVariantSource(variants[v], duration);
+                if (src) sources.push(src);
+            }
+            hlsSourcesAdded = true;
+        }
     }
 
-    // Keep MP4/M4V as a real fallback, de mejor a peor calidad.
+    // Respaldo si no se pudieron extraer las calidades
+    if (!hlsSourcesAdded) {
+        for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
+            let src = makeHlsSource(hls[i], duration);
+            if (src) {
+                src.name = i === 0 ? "OK.ru Auto (HLS)" : "OK.ru HLS " + (i + 1);
+                sources.push(src);
+            }
+        }
+    }
+
+    // Agregar fuentes MP4 (si existen)
     for (let j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
         let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
         if (src) sources.push(src);
-    }
-
-    if (sources.length === 0) {
-        if (containsExternalVideoEmbed(html)) {
-            throw new Error(
-                "Este video es un embed de YouTube, búscalo por su plugin"
-            );
-        }
-        throw new Error(
-            "No playable direct HLS/MP4 source found\n" + debugText()
-        );
     }
 
     let thumbs = [];
@@ -1794,30 +1811,6 @@ function doDetails(url) {
     let details = buildVideoDetails(meta, canonical, fallbackTitle, html);
 
     addDebug("doDetails TOTAL: " + (nowMs() - tStart) + "ms");
-
-    // DIAGNÓSTICO TEMPORAL: la descripción no se muestra en la UI de
-    // GrayJay para esta fuente, así que el resumen de tiempos/fuentes se
-    // antepone al TÍTULO (que sí siempre es visible) para poder leerlo sin
-    // logs externos. Sacar este bloque una vez diagnosticado.
-    try {
-        function dline(prefix) {
-            for (let i = 0; i < DEBUG.length; i++) {
-                if (DEBUG[i].indexOf(prefix) === 0) return DEBUG[i];
-            }
-            return "";
-        }
-        let diag = [
-            dline("loadOkPage TOTAL:"),
-            dline("OK page loaded via attempt") || dline("attempt"),
-            dline("extractMetadataFromHtml:"),
-            dline("fetchMetadataUrl:"),
-            dline("sources hls="),
-            dline("primary HLS"),
-            dline("doDetails TOTAL:")
-        ].filter(function (s) { return s; }).join(" | ");
-
-        details.name = "[DIAG] " + diag + "  ::  " + (details.name || "");
-    } catch (_) {}
 
     return details;
 }
