@@ -614,34 +614,18 @@ function parseMetadata(html, pageUrl) {
 
     if (!meta) return null;
 
-    let inlineHls = collectHlsUrls(meta).length;
-    let inlineMp4 = collectMp4Urls(meta).length;
-    let hasMetadataUrlField = !!(
-        meta.metadataUrl || meta.metadataURL ||
-        (meta.flashvars && (meta.flashvars.metadataUrl || meta.flashvars.metadataURL))
-    );
-    addDebug("inline meta hls=" + inlineHls + " mp4=" + inlineMp4 +
-        " metadataUrlField=" + (hasMetadataUrlField ? "yes" : "no"));
-
-    // FIX (calidad): antes se saltaba fetchMetadataUrl apenas el inline
-    // metadata tenía UNA fuente jugable, asumiendo que alcanzaba. Pero en
-    // ok.ru esa única fuente suele ser un link de baja calidad para el
-    // primer pintado de la página, mientras que metadataUrl trae la lista
-    // completa de calidades. Ahora solo se saltea si el inline ya parece
-    // "rico" (más de 1 HLS o algún MP4).
-    let looksRich = inlineHls > 1 || inlineMp4 > 0;
-    if (looksRich || !hasMetadataUrlField) return meta;
+    // Se probó pedir metadataUrl SIEMPRE (incluso con una fuente inline ya
+    // jugable) para descartar que trajera más calidades. Con datos reales
+    // se confirmó que no traía nada mejor y solo sumaba ~1.5s por request.
+    // Se vuelve al comportamiento original: solo se pide de más si hace
+    // falta.
+    if (metaHasPlayableSource(meta)) return meta;
 
     let t1 = nowMs();
     let fetched = fetchMetadataUrl(meta, pageUrl);
     addDebug("fetchMetadataUrl: " + (nowMs() - t1) + "ms");
 
-    if (fetched) {
-        let fHls = collectHlsUrls(fetched).length;
-        let fMp4 = collectMp4Urls(fetched).length;
-        addDebug("fetched meta hls=" + fHls + " mp4=" + fMp4);
-        if (fHls + fMp4 > inlineHls + inlineMp4) return fetched;
-    }
+    if (fetched) return fetched;
 
     return meta;
 }
@@ -1367,38 +1351,19 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         (mp4.length ? " labels=[" + mp4Labels.join(",") + "]" : ""));
     if (hls.length > 0) addDebug("hls[0] url=" + hls[0]);
 
-    // Intentar abrir el primer master .m3u8 y sacar sus variantes reales
-    // de calidad (ver expandHlsVariants). Si falla o no es un master, se
-    // sigue usando el/los .m3u8 tal cual, como antes.
-    let variants = [];
-    if (hls.length > 0) {
-        variants = expandHlsVariants(hls[0]);
-        addDebug("hls variantes encontradas: " + variants.length +
-            (variants.length ? " top=" + (variants[0].height || variants[0].bandwidth) : ""));
-    }
-
+    // NOTA: se probó bajar y parsear el master .m3u8 acá mismo (ver
+    // expandHlsVariants) para exponer variantes explícitas por si Chromecast
+    // elegía mal. Con datos reales se vio que ese fetch SIEMPRE fallaba
+    // (0 bytes) desde el contexto del script, mientras que GrayJay/ExoPlayer
+    // sí lo parsea perfecto por su cuenta (la propia app ya muestra el menú
+    // de calidades 1440p→144p). O sea que el master que se pasa tal cual ya
+    // es correcto; no hacía falta reprocesarlo, y esa llamada solo agregaba
+    // latencia sin ningún beneficio. Se volvió a pasar el/los .m3u8 directo.
     let sources = [];
 
-    if (variants.length > 1) {
-        // Variantes explícitas primero, de mayor a menor calidad.
-        for (let v = 0; v < variants.length && sources.length < MAX_SOURCES; v++) {
-            let src = makeHlsVariantSource(variants[v], duration);
-            if (src) sources.push(src);
-        }
-        // El master queda como respaldo "Auto" al final de las HLS.
-        for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
-            let src = makeHlsSource(hls[i], duration);
-            if (src) {
-                try { src.name = "OK.ru HLS Auto"; } catch (_) {}
-                sources.push(src);
-            }
-        }
-    } else {
-        // HLS first. These are direct media URLs, not player pages.
-        for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
-            let src = makeHlsSource(hls[i], duration);
-            if (src) sources.push(src);
-        }
+    for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
+        let src = makeHlsSource(hls[i], duration);
+        if (src) sources.push(src);
     }
 
     // Keep MP4/M4V as a real fallback, de mejor a peor calidad.
@@ -1466,12 +1431,9 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     }
 
     let firstHls = null;
-    if (variants.length > 0) {
-        firstHls = makeHlsVariantSource(variants[0], duration);
-        addDebug("primary HLS (variante " + (variants[0].height || variants[0].bandwidth) + "): " + variants[0].url);
-    } else if (hls.length > 0) {
+    if (hls.length > 0) {
         firstHls = makeHlsSource(hls[0], duration);
-        addDebug("primary HLS (master): " + hls[0]);
+        addDebug("primary HLS: " + hls[0]);
     } else if (mp4.length > 0) {
         addDebug("primary MP4 (" + (mp4[0].label || "?") + "): " + mp4[0].url);
     }
@@ -1865,12 +1827,8 @@ function doDetails(url) {
             dline("loadOkPage TOTAL:"),
             dline("OK page loaded via attempt") || dline("attempt"),
             dline("extractMetadataFromHtml:"),
-            dline("inline meta hls="),
             dline("fetchMetadataUrl:"),
-            dline("fetched meta hls="),
             dline("sources hls="),
-            dline("m3u8 fetch:"),
-            dline("hls variantes encontradas:"),
             dline("primary HLS"),
             dline("doDetails TOTAL:")
         ].filter(function (s) { return s; }).join(" | ");
