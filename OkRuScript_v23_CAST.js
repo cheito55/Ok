@@ -1357,8 +1357,11 @@ function fetchSearchPage(query, page) {
     let url = SEARCH_URL_BASE + encodeURIComponent(safeStr(query));
     if (page > 1) url += "&st.page=" + page;
 
-    let html = httpGetAuthenticated(url);
-    if (!html) html = httpGet(url);
+    // FIX (velocidad): la búsqueda es pública, no hace falta la cookie de
+    // sesión ni, por lo tanto, pedirle nada al Worker acá. Antes esto pasaba
+    // por httpGetAuthenticated() y disparaba (hasta 4 veces por búsqueda,
+    // una por página) un llamado al Worker que podía demorar/colgar.
+    let html = httpGet(url);
     return html || "";
 }
 
