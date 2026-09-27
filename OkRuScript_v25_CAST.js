@@ -1178,6 +1178,112 @@ function makeHlsSource(url, duration) {
     return null;
 }
 
+// FIX (calidad de cast): cuando el metadata solo trae UNA url .m3u8, en
+// muchos casos es un MASTER playlist (adaptativo) con varias variantes
+// adentro (#EXT-X-STREAM-INF). Dentro de la app, el player local sí sabe
+// elegir la mejor variante del master, pero al castear a Chromecast el
+// receptor puede terminar quedándose con la variante más baja. La forma
+// confiable de evitar eso es bajar el master, leer sus variantes reales
+// (BANDWIDTH/RESOLUTION) y ofrecerlas como fuentes HLS separadas y
+// nombradas (ej. "OK.ru HLS 1080p"), de mayor a menor calidad, en vez de
+// depender de que el receptor negocie bien el ABR del master.
+function resolveM3u8Uri(uri, masterUrl) {
+    uri = cleanUrl(uri);
+    if (!uri) return "";
+    if (/^https?:\/\//i.test(uri)) return uri;
+
+    try {
+        if (uri.indexOf("//") === 0) return "https:" + uri;
+
+        if (uri.indexOf("/") === 0) {
+            let m = safeStr(masterUrl).match(/^(https?:\/\/[^/]+)/i);
+            return m ? m[1] + uri : uri;
+        }
+
+        let noQuery = safeStr(masterUrl).split("?")[0];
+        let baseDir = noQuery.substring(0, noQuery.lastIndexOf("/") + 1);
+        return baseDir + uri;
+    } catch (_) {
+        return normalizeUrl(uri, masterUrl);
+    }
+}
+
+function fetchTextWithOkHeaders(url) {
+    try {
+        return httpGet(url, {
+            "User-Agent": UA_DESKTOP,
+            "Referer": "https://ok.ru/",
+            "Origin": "https://ok.ru",
+            "Accept": "*/*"
+        });
+    } catch (_) {
+        return "";
+    }
+}
+
+function expandHlsVariants(masterUrl) {
+    let out = [];
+    try {
+        let body = fetchTextWithOkHeaders(masterUrl);
+        if (!body || body.indexOf("#EXT-X-STREAM-INF") < 0) {
+            addDebug("expandHlsVariants: no es un master playlist (o vacío)");
+            return out;
+        }
+
+        let lines = body.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            let line = lines[i];
+            if (line.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+
+            let uriLine = "";
+            for (let j = i + 1; j < lines.length; j++) {
+                let t = lines[j].trim();
+                if (!t || t.charAt(0) === "#") continue;
+                uriLine = t;
+                break;
+            }
+            if (!uriLine) continue;
+
+            let bandwidth = 0;
+            let bm = line.match(/BANDWIDTH=(\d+)/i);
+            if (bm) bandwidth = parseInt(bm[1], 10) || 0;
+
+            let width = 0, height = 0;
+            let rm = line.match(/RESOLUTION=(\d+)x(\d+)/i);
+            if (rm) {
+                width = parseInt(rm[1], 10) || 0;
+                height = parseInt(rm[2], 10) || 0;
+            }
+
+            let variantUrl = resolveM3u8Uri(uriLine, masterUrl);
+            if (!isHttpUrl(variantUrl)) continue;
+
+            out.push({ url: variantUrl, width: width, height: height, bandwidth: bandwidth });
+        }
+    } catch (e) {
+        addDebug("expandHlsVariants EXCEPTION: " + e);
+    }
+
+    out.sort(function (a, b) {
+        if (b.height !== a.height) return b.height - a.height;
+        return b.bandwidth - a.bandwidth;
+    });
+
+    return out;
+}
+
+function makeHlsVariantSource(variant, duration) {
+    let src = makeHlsSource(variant.url, duration);
+    if (!src) return null;
+    try {
+        let label = variant.height
+            ? (variant.height + "p")
+            : (variant.bandwidth ? Math.round(variant.bandwidth / 1000) + "kbps" : "?");
+        src.name = "OK.ru HLS " + label;
+    } catch (_) {}
+    return src;
+}
+
 function makeMp4Source(url, duration, index, label) {
     try {
         let lower = safeStr(url).toLowerCase();
@@ -1240,12 +1346,38 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         (mp4.length ? " labels=[" + mp4Labels.join(",") + "]" : ""));
     if (hls.length > 0) addDebug("hls[0] url=" + hls[0]);
 
+    // Intentar abrir el primer master .m3u8 y sacar sus variantes reales
+    // de calidad (ver expandHlsVariants). Si falla o no es un master, se
+    // sigue usando el/los .m3u8 tal cual, como antes.
+    let variants = [];
+    if (hls.length > 0) {
+        variants = expandHlsVariants(hls[0]);
+        addDebug("hls variantes encontradas: " + variants.length +
+            (variants.length ? " top=" + (variants[0].height || variants[0].bandwidth) : ""));
+    }
+
     let sources = [];
 
-    // HLS first. These are direct media URLs, not player pages.
-    for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
-        let src = makeHlsSource(hls[i], duration);
-        if (src) sources.push(src);
+    if (variants.length > 1) {
+        // Variantes explícitas primero, de mayor a menor calidad.
+        for (let v = 0; v < variants.length && sources.length < MAX_SOURCES; v++) {
+            let src = makeHlsVariantSource(variants[v], duration);
+            if (src) sources.push(src);
+        }
+        // El master queda como respaldo "Auto" al final de las HLS.
+        for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
+            let src = makeHlsSource(hls[i], duration);
+            if (src) {
+                try { src.name = "OK.ru HLS Auto"; } catch (_) {}
+                sources.push(src);
+            }
+        }
+    } else {
+        // HLS first. These are direct media URLs, not player pages.
+        for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
+            let src = makeHlsSource(hls[i], duration);
+            if (src) sources.push(src);
+        }
     }
 
     // Keep MP4/M4V as a real fallback, de mejor a peor calidad.
@@ -1313,9 +1445,12 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     }
 
     let firstHls = null;
-    if (hls.length > 0) {
+    if (variants.length > 0) {
+        firstHls = makeHlsVariantSource(variants[0], duration);
+        addDebug("primary HLS (variante " + (variants[0].height || variants[0].bandwidth) + "): " + variants[0].url);
+    } else if (hls.length > 0) {
         firstHls = makeHlsSource(hls[0], duration);
-        addDebug("primary HLS: " + hls[0]);
+        addDebug("primary HLS (master): " + hls[0]);
     } else if (mp4.length > 0) {
         addDebug("primary MP4 (" + (mp4[0].label || "?") + "): " + mp4[0].url);
     }
@@ -1711,7 +1846,8 @@ function doDetails(url) {
             dline("extractMetadataFromHtml:"),
             dline("fetchMetadataUrl:"),
             dline("sources hls="),
-            dline("hls[0] url="),
+            dline("hls variantes encontradas:"),
+            dline("primary HLS"),
             dline("doDetails TOTAL:")
         ].filter(function (s) { return s; }).join(" | ");
 
