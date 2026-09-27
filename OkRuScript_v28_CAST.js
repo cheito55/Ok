@@ -1,17 +1,20 @@
 /*
- * GrayJay - OK.ru Source v28 COOKIE EXTRACTION + CAST SIN COOKIE
+ * GrayJay - OK.ru Source v29 COOKIE EXTRACTION + CAST SIN COOKIE
  * - Cookie de sesión servida por un Worker de Cloudflare (COOKIE_WORKER_URL)
  *   en vez de estar hardcodeada, para no depender de republicar el plugin
  *   cada vez que vence (~30 días).
- * - Cookie de sesión usada SOLO en la búsqueda de videos.
- * - Extracción de página/metadata y reproducción HLS/MP4 SIN Cookie.
+ * - Cookie de sesión usada SOLO en la búsqueda de videos (fetchSearchPage /
+ *   httpGetAuthenticated). Todo lo demás (página de detalle, metadata,
+ *   fuentes HLS/MP4 que llegan al reproductor/Cast) va SIN cookie.
  * - requestModifier (Referer/User-Agent de ok.ru, sin cookie) en las
  *   fuentes HLS/MP4 para que el cast a Chromecast funcione.
- * - v28: se reactivó la expansión del master HLS en variantes con calidad
- *   explícita (estaba escrita pero nunca se llamaba) con fallback seguro
- *   al comportamiento anterior si la descarga del master vuelve vacía.
- * - v28: se detecta video embebido de YouTube (por metadata o por iframe
- *   en el HTML) y se avisa en vez de tirar un error genérico.
+ * - v28 intentó reactivar expandHlsVariants() para partir el master HLS en
+ *   variantes con calidad explícita; v29 lo revierte: se confirmó que la
+ *   descarga del master desde el contexto del script sigue devolviendo
+ *   vacío, así que solo agregaba latencia a cada video sin ninguna
+ *   variante a cambio. Las funciones quedan definidas pero sin invocar.
+ * - v28/v29: se detecta video embebido de YouTube (por metadata o por
+ *   iframe en el HTML) y se avisa con el link en vez de un error genérico.
  *
  * Hybrid: original v5 search/details contract + explicit GrayJay session auth.
  *
@@ -1464,44 +1467,17 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
      */
     let sources = [];
 
-    // FIX v28 (calidad de cast, automática): expandHlsVariants/makeHlsVariantSource
-    // ya existían en el archivo pero nunca se llamaban desde acá, así que el
-    // master siempre se ofrecía como única fuente HLS (ABR) y el cast quedaba
-    // a merced de cómo el receptor de Chromecast negocia el bitrate. Se
-    // reintenta la expansión acá. Si el master vuelve a devolver vacío desde
-    // el contexto del script (como ya se documentó en pruebas anteriores),
-    // hlsVariants queda en [] y se cae exactamente al comportamiento previo
-    // (un solo master + MP4 con label conocida como primary) — no hay
-    // regresión posible si la expansión no funciona en este entorno.
-    let hlsVariants = [];
-    if (hls.length > 0) {
-        hlsVariants = expandHlsVariants(hls[0]);
-        addDebug("HLS variants expandidos: " + hlsVariants.length);
-    }
-
-    if (hlsVariants.length > 0) {
-        // Variantes con resolución/bandwidth conocidos, de mayor a menor
-        // (expandHlsVariants ya las ordena así). La primera queda como
-        // fuente primaria explícita para Cast, sin depender del ABR.
-        for (let i = 0; i < hlsVariants.length && sources.length < MAX_SOURCES; i++) {
-            let vsrc = makeHlsVariantSource(hlsVariants[i], duration);
-            if (vsrc) sources.push(vsrc);
-        }
-        addDebug("CAST primary: HLS variant " +
-            (hlsVariants[0].height ? hlsVariants[0].height + "p" : (hlsVariants[0].bandwidth || "?")));
-
-        // El master queda de último recurso, por si algún dispositivo
-        // puntual no aceptara la variante directa.
-        if (sources.length < MAX_SOURCES) {
-            let masterSrc = makeHlsSource(hls[0], duration);
-            if (masterSrc) {
-                masterSrc.name = "OK.ru Auto HLS (Master)";
-                sources.push(masterSrc);
-            }
-        }
-    } else {
-        let bestMp4Index = -1;
-        let bestMp4Order = -1;
+    // REVERTIDO en v29: se probó reactivar expandHlsVariants() para bajar
+    // el master y ofrecer variantes con calidad explícita. Se confirmó con
+    // datos reales que la descarga del master desde el contexto del script
+    // sigue devolviendo vacío (igual que en las pruebas documentadas
+    // anteriormente), así que esto no aportaba ninguna variante — solo
+    // agregaba una request de más (y su latencia) a CADA video. Se saca la
+    // llamada; las funciones quedan definidas más abajo por si en el futuro
+    // se quiere reintentar con otro enfoque (headers/redirects distintos),
+    // pero no se invocan.
+    let bestMp4Index = -1;
+    let bestMp4Order = -1;
 
         for (let j = 0; j < mp4.length; j++) {
             let q = qualityInfo(mp4[j].label);
@@ -1539,7 +1515,6 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
             if (j === bestMp4Index) continue;
             let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
             if (src) sources.push(src);
-        }
     }
 
     let thumbs = [];
