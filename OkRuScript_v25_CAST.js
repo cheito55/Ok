@@ -366,40 +366,17 @@ function httpGetAuthenticated(url) {
 }
 
 function loadOkPage(url) {
-    let desktop = {
-        "User-Agent": UA_DESKTOP
-    };
-
-    let mobile = {
-        "User-Agent":
-            "Mozilla/5.0 (Linux; Android 14; Pixel 8) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) " +
-            "Chrome/136.0.0.0 Mobile Safari/537.36"
-    };
-
-    // FIX: antes se repetía la misma request autenticada dos veces
-    // (misma URL, misma cookie -> mismo resultado). Se saca el duplicado
-    // para no sumar un round-trip inútil al tiempo de carga.
-    let attempts = [
-        function () { return httpGetAuthenticated(url); },
-        function () { return httpGet(url, desktop); },
-        function () { return httpGet(url, mobile); }
-    ];
-
-    for (let i = 0; i < attempts.length; i++) {
-        try {
-            let t0 = nowMs();
-            let body = attempts[i]();
-            let ms = nowMs() - t0;
-            if (body && body.length > 300) {
-                addDebug("OK page loaded via attempt " + i + " (" + ms + "ms, " + body.length + " bytes)");
-                return body;
-            }
-            addDebug("attempt " + i + " vacío/corto (" + ms + "ms)");
-        } catch (_) {}
+    let t0 = nowMs();
+    let body = httpGetAuthenticated(url);
+    let ms = nowMs() - t0;
+    
+    if (body && body.length > 300) {
+        addDebug("OK page loaded authenticated (" + ms + "ms)");
+        return body;
     }
 
-    return "";
+    addDebug("Fallback to desktop UA");
+    return httpGet(url, { "User-Agent": UA_DESKTOP });
 }
 
 function tryParseJson(value) {
@@ -1154,6 +1131,12 @@ function okRequestModifier() {
         "Referer": "https://ok.ru/",
         "Origin": "https://ok.ru"
     };
+    
+    let cookie = getOkCookie();
+    if (cookie) {
+        h["Cookie"] = cookie;
+    }
+
     return {
         headers: h,
         modifyRequest: function (url, headers) {
