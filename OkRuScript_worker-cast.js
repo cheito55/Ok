@@ -274,7 +274,8 @@ function httpGet(url, headers) {
 
         mergeHeaders(h, headers);
 
-        let r = http.GET(url, h);
+        // false = sin sesión. La cookie de GrayJay solo se usa en la búsqueda.
+        let r = http.GET(url, h, false);
         if (!r) return "";
 
         let body = "";
@@ -311,7 +312,7 @@ function httpPost(url, body, headers) {
         };
         mergeHeaders(h, headers);
 
-        let r = http.POST(url, body || "", h);
+        let r = http.POST(url, body || "", h, false);
         if (!r) return "";
 
         let respBody = "";
@@ -639,7 +640,17 @@ function getTitle(meta, fallback, id) {
         v = "";
     }
 
-    return v || cleanText(fallback) || "OK.ru video";
+    let fb = cleanText(fallback);
+
+    // OK.ru manda title = See video "Nombre" on OK. Video Player
+    // Eso no tiene que ver con la cookie. Preferimos el nombre de la búsqueda.
+    let wrapped = /see video\s+["«“'](.+?)["»”']/i.exec(v);
+    if (wrapped) v = cleanText(wrapped[1]);
+    if (/see video|on ok\.?\s*video player/i.test(v) && fb && !/see video/i.test(fb)) {
+        return fb;
+    }
+
+    return v || fb || "OK.ru video";
 }
 
 function getPoster(meta) {
@@ -873,7 +884,7 @@ function fetchTextWithOkHeaders(url) {
         };
         // Sin Cookie deliberadamente: esto es lectura del manifest durante
         // la extracción de variantes, no búsqueda.
-        let r = http.GET(url, headers);
+        let r = http.GET(url, headers, false);
         if (!r) return "";
         let body = "";
         try { body = r.body; } catch (_) {}
@@ -1424,7 +1435,9 @@ function extractPageTitle(html) {
     let m = safeStr(html).match(/<title[^>]*>([^<]+)<\/title>/i);
     if (m) {
         let t = cleanText(m[1])
+            .replace(/^(?:see|watch|ver)\s+video\s+["«“'](.+?)["»”']\s+on\s+ok.*$/i, "$1")
             .replace(/\s*[|\-–]\s*OK\.?RU.*$/i, "")
+            .replace(/\s+on\s+OK\.?\s*Video Player\s*$/i, "")
             .trim();
         if (!isGenericSiteTitle(t)) return t;
     }
