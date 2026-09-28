@@ -25,8 +25,8 @@
     "mobile.ok.ru"
   ],
   "authentication": {
-    "loginUrl": "https://ok.ru/",
-    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "loginUrl": "https://m.ok.ru/dk?st.cmd=anonymMain",
+    "userAgent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
     "cookiesToFind": [
       "AUTHCODE"
     ],
@@ -37,6 +37,6 @@
       "m.ok.ru",
       "mobile.ok.ru"
     ],
-    "loginWarning": "Entra con TU cuenta de OK.ru. Cuando el login termine, GrayJay cierra solo esta ventana."
+    "loginWarning": "NO uses Entrar con Google. Google bloquea el navegador interno de GrayJay. Entra con telefono o email y la contrasena de OK.ru."
   }
 }
