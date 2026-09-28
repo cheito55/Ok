@@ -223,13 +223,32 @@ function isExternalProvider(url) {
 
 
 function containsExternalVideoEmbed(value) {
+    return !!extractYouTubeId(value);
+}
+
+function extractYouTubeId(value) {
     let x = safeStr(value)
         .replace(/\\u002F/gi, "/")
         .replace(/\\\//g, "/")
         .replace(/&amp;/gi, "&");
 
-    return /(?:youtube(?:-nocookie)?\.com|youtu\.be|vimeo\.com)/i.test(x) &&
-           /(?:iframe|embed|externalVideo|externalVideoId|youtubeId|youtubeVideoId|playerResponse|watch\?v=|youtube(?:-nocookie)?\.com\/(?:embed|watch|shorts|live|v)|youtu\.be\/)/i.test(x);
+    // Evitar falsos positivos del player de OK ("paths":{"youtube"...}).
+    let patterns = [
+        /(?:youtube(?:-nocookie)?\.com\/(?:embed|shorts|live|v)\/)([A-Za-z0-9_-]{11})/i,
+        /(?:youtube(?:-nocookie)?\.com\/watch\?(?:[^"'<>]*&)?v=)([A-Za-z0-9_-]{11})/i,
+        /youtu\.be\/([A-Za-z0-9_-]{11})/i,
+        /(?:externalVideoId|youtubeId|youtubeVideoId)\s*[:=]\s*["']([A-Za-z0-9_-]{11})["']/i
+    ];
+    for (let i = 0; i < patterns.length; i++) {
+        let m = x.match(patterns[i]);
+        if (m) return m[1];
+    }
+    return "";
+}
+
+function youtubeWatchUrl(id) {
+    id = safeStr(id);
+    return id ? ("https://www.youtube.com/watch?v=" + id) : "";
 }
 
 function isM3u8Url(url) {
@@ -623,13 +642,21 @@ function firstValue(obj, keys) {
 }
 
 function getTitle(meta, fallback, id) {
-    let v = cleanText(firstValue(meta, [
-        "title",
-        "name",
-        "movieTitle",
-        "videoTitle",
-        "caption"
-    ]));
+    // En este tipo de video el nombre viene en meta.movie.title,
+    // no en meta.title (que a veces está vacío o es el wrapper).
+    let v = "";
+    if (safeObj(meta) && safeObj(meta.movie)) {
+        v = cleanText(meta.movie.title || meta.movie.name || "");
+    }
+    if (!v) {
+        v = cleanText(firstValue(meta, [
+            "title",
+            "name",
+            "movieTitle",
+            "videoTitle",
+            "caption"
+        ]));
+    }
 
     // FIX: cuando el video no tiene título propio, OK.ru a veces devuelve
     // en "title"/"name" el mismo ID numérico del video en vez de dejarlo
@@ -654,6 +681,9 @@ function getTitle(meta, fallback, id) {
 }
 
 function getPoster(meta) {
+    if (safeObj(meta) && safeObj(meta.movie) && meta.movie.poster) {
+        return safeStr(meta.movie.poster);
+    }
     return firstValue(meta, [
         "poster",
         "posterUrl",
@@ -668,20 +698,26 @@ function getPoster(meta) {
 }
 
 function getDuration(meta) {
-    let v = firstValue(meta, [
-        "duration",
-        "durationMs",
-        "durationSec",
-        "length",
-        "videoDuration"
-    ]);
+    let v = "";
+    if (safeObj(meta) && safeObj(meta.movie)) {
+        v = firstValue(meta.movie, ["duration", "durationMs", "durationSec"]);
+    }
+    if (!v) {
+        v = firstValue(meta, [
+            "duration",
+            "durationMs",
+            "durationSec",
+            "length",
+            "videoDuration"
+        ]);
+    }
 
     let n = parseFloat(v);
     if (!isFinite(n) || n <= 0) return 0;
 
-    // GrayJay commonly expects seconds.
+    // GrayJay expects seconds. OK.ru movie.duration ya viene en segundos
+    // (ej. 1037 = 17 min). Solo ms si es un número enorme.
     if (n > 100000) n = n / 1000;
-    else if (n > 1000 && n < 100000) n = n / 1000;
 
     return Math.round(n);
 }
@@ -969,6 +1005,7 @@ function makeMp4Source(url, duration, index, label) {
         if (/\.m4v(?:$|[?#])/.test(lower)) container = "m4v";
         else if (/\.webm(?:$|[?#])/.test(lower)) container = "webm";
         else if (/\.mov(?:$|[?#])/.test(lower)) container = "mov";
+        else if (/okcdn\.ru/i.test(lower)) container = "mp4";
 
         let q = qualityInfo(label);
         let name = q
@@ -1037,32 +1074,8 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
      */
     let sources = [];
 
-    let bestMp4Index = -1;
-    let bestMp4Order = -1;
-
-    for (let j = 0; j < mp4.length; j++) {
-        let q = qualityInfo(mp4[j].label);
-        let order = q ? q.order : -1;
-        if (order > bestMp4Order) {
-            bestMp4Order = order;
-            bestMp4Index = j;
-        }
-    }
-
-    if (bestMp4Index >= 0 && bestMp4Order >= 70) {
-        let bestSrc = makeMp4Source(
-            mp4[bestMp4Index].url,
-            duration,
-            bestMp4Index,
-            mp4[bestMp4Index].label
-        );
-        if (bestSrc) {
-            sources.push(bestSrc);
-            addDebug("CAST primary: MP4 " + (mp4[bestMp4Index].label || "?"));
-        }
-    }
-
-    // HLS master directo, sin round-trip adicional.
+    // HLS primero: en videos como 9132112939654 el MP4 de okcdn no tiene
+    // .mp4 y pesa cientos de MB; el player lista calidades y no arranca.
     for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
         let src = makeHlsSource(hls[i], duration);
         if (src) {
@@ -1071,11 +1084,22 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
-    // El resto de MP4 queda como fallback.
     for (let j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
-        if (j === bestMp4Index) continue;
         let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
         if (src) sources.push(src);
+    }
+
+    if (!sources.length) {
+        let yt = extractYouTubeId(html);
+        if (!yt) {
+            try { yt = extractYouTubeId(JSON.stringify(meta)); } catch (_) {}
+        }
+        if (yt) {
+            throw new Error(
+                "Este item es un embed de YouTube. Abrilo con la fuente YouTube:\n" +
+                youtubeWatchUrl(yt)
+            );
+        }
     }
 
     let thumbs = [];
@@ -1170,8 +1194,7 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     if (!id || seen[id] || results.length >= 96) return;
     block = safeStr(block);
 
-    // Do not expose an OK.ru item whose actual player is an external provider.
-    if (containsExternalVideoEmbed(block)) return;
+    let youtubeId = extractYouTubeId(block);
 
     let title = cleanText(anchorTitle || "");
 
@@ -1220,14 +1243,15 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     // llamada posterior a getContentDetails(). Para no depender de eso, el
     // título viaja directamente adentro de la URL que se le entrega a
     // GrayJay; es la misma URL que después vuelve en getContentDetails(url).
-    let urlWithTitle =
-        "https://ok.ru/video/" + id +
-        (!/^OK\.ru video\b/i.test(title)
-            ? "?t=" + encodeURIComponent(title)
-            : "");
+    let urlWithTitle = youtubeId
+        ? youtubeWatchUrl(youtubeId)
+        : ("https://ok.ru/video/" + id +
+            (!/^OK\.ru video\b/i.test(title)
+                ? "?t=" + encodeURIComponent(title)
+                : ""));
 
     results.push({
-        id: id,
+        id: youtubeId ? ("yt:" + youtubeId) : id,
         url: urlWithTitle,
         title: title,
         thumbnail: poster,
