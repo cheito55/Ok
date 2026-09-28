@@ -1,0 +1,42 @@
+{
+  "name": "OK.ru",
+  "description": "Plugin no oficial para reproducir videos de OK.ru (Odnoklassniki) dentro de GrayJay. Requiere login de tu cuenta para buscar.",
+  "author": "Lucas",
+  "authorUrl": "",
+  "platformUrl": "https://ok.ru",
+  "sourceUrl": "https://raw.githubusercontent.com/cheito55/Ok/main/OkRuConfig.json",
+  "repositoryUrl": "https://github.com/cheito55/Ok",
+  "scriptUrl": "https://raw.githubusercontent.com/cheito55/Ok/main/OkRuScript_worker-cast.js",
+  "version": 6,
+  "iconUrl": "https://raw.githubusercontent.com/cheito55/Ok/main/ok.png",
+  "id": "62af0e2f-bfd9-489f-afe1-f66583d2f7d0",
+  "scriptSignature": "",
+  "scriptPublicKey": "",
+  "packages": [
+    "Http",
+    "DOMParser",
+    "Utilities"
+  ],
+  "allowEval": false,
+  "allowUrls": [
+    "ok.ru",
+    "www.ok.ru",
+    "m.ok.ru",
+    "mobile.ok.ru"
+  ],
+  "authentication": {
+    "loginUrl": "https://ok.ru/",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "cookiesToFind": [
+      "AUTHCODE"
+    ],
+    "cookiesExclOthers": false,
+    "allowedDomains": [
+      "ok.ru",
+      "www.ok.ru",
+      "m.ok.ru",
+      "mobile.ok.ru"
+    ],
+    "loginWarning": "Entra con TU cuenta de OK.ru. Cuando el login termine, GrayJay cierra solo esta ventana."
+  }
+}
