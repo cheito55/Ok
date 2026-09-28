@@ -103,9 +103,32 @@ function putCachedDetails(id, value) {
     } catch (_) {}
 }
 
+function unwrapOkTitle(s) {
+    s = cleanText(s);
+    if (!s) return "";
+
+    // OK.ru / embed: See video "Historia de Evan" on OK. Video Player
+    let m = s.match(
+        /^(?:see|watch|ver|ver el|смотреть)\s+(?:el\s+)?video\s+["«“'](.+?)["»”']\s+(?:on|en|на)\s+ok/i
+    );
+    if (m) return cleanText(m[1]);
+
+    m = s.match(/^(?:see|watch|ver)\s+video\s+["«“'](.+?)["»”']/i);
+    if (m) return cleanText(m[1]);
+
+    s = s
+        .replace(/\s+on\s+OK\.?\s*Video Player\s*$/i, "")
+        .replace(/\s+on\s+OK\.?\s*$/i, "")
+        .replace(/\s*[|\-–]\s*OK\.?RU.*$/i, "")
+        .trim();
+
+    if (/^(?:ok(?:\.ru)?(?:\s+video(?:\s+player)?)?)$/i.test(s)) return "";
+    return s;
+}
+
 function rememberTitle(id, title) {
     id = safeStr(id);
-    title = cleanText(title);
+    title = unwrapOkTitle(title);
     if (!id || !title) return;
     if (/^OK\.ru video\b/i.test(title)) return; // no guardar títulos genéricos
 
@@ -126,7 +149,7 @@ function recallTitle(id) {
 function extractTitleParam(url) {
     try {
         let m = safeStr(url).match(/[?&]t=([^&]+)/);
-        if (m) return cleanText(decodeURIComponent(m[1]));
+        if (m) return unwrapOkTitle(decodeURIComponent(m[1]));
     } catch (_) {}
     return "";
 }
@@ -229,19 +252,47 @@ function getHost(url) {
 function isExternalProvider(url) {
     let h = getHost(url);
     if (!h) return false;
-    return /youtube\.com|youtu\.be|vimeo\.com/i.test(h);
+    return /(?:^|\.)(?:youtube(?:-nocookie)?\.com|youtu\.be|vimeo\.com)$/i.test(h);
 }
 
+function isDirectMediaUrl(url) {
+    url = normalizeUrl(url);
+    if (!isHttpUrl(url)) return false;
+    if (isExternalProvider(url)) return false;
+    // Página del player de OK.ru, no un archivo de video.
+    if (/ok\.ru\/(?:video|videoembed|live|dk)\b/i.test(url)) return false;
+    return true;
+}
 
-
-function containsExternalVideoEmbed(value) {
+function extractYouTubeId(value) {
     let x = safeStr(value)
         .replace(/\\u002F/gi, "/")
         .replace(/\\\//g, "/")
+        .replace(/\\+/g, "")
         .replace(/&amp;/gi, "&");
 
-    return /(?:youtube(?:-nocookie)?\.com|youtu\.be|vimeo\.com)/i.test(x) &&
-           /(?:iframe|embed|externalVideo|externalVideoId|youtubeId|youtubeVideoId|playerResponse|watch\?v=|youtube(?:-nocookie)?\.com\/(?:embed|watch|shorts|live|v)|youtu\.be\/)/i.test(x);
+    let patterns = [
+        /(?:youtube(?:-nocookie)?\.com\/(?:embed|shorts|live|v)\/)([A-Za-z0-9_-]{11})/i,
+        /(?:youtube(?:-nocookie)?\.com\/watch\?(?:[^"'<>]*&)?v=)([A-Za-z0-9_-]{11})/i,
+        /youtu\.be\/([A-Za-z0-9_-]{11})/i,
+        /(?:externalVideoId|youtubeId|youtubeVideoId|videoId)\s*[:=]\s*["']([A-Za-z0-9_-]{11})["']/i
+    ];
+
+    for (let i = 0; i < patterns.length; i++) {
+        let m = x.match(patterns[i]);
+        if (m) return m[1];
+    }
+    return "";
+}
+
+function youtubeWatchUrl(id) {
+    id = safeStr(id);
+    return id ? ("https://www.youtube.com/watch?v=" + id) : "";
+}
+
+function containsExternalVideoEmbed(value) {
+    return !!extractYouTubeId(value) ||
+        /vimeo\.com\/(?:video\/)?\d+/i.test(safeStr(value));
 }
 
 function isM3u8Url(url) {
@@ -376,6 +427,7 @@ function pageLooksPlayable(html) {
     html = safeStr(html);
     if (!html) return false;
     return /data-options\s*=/i.test(html) ||
+           /flashvars/i.test(html) ||
            /hlsManifestUrl/i.test(html) ||
            /"videos"\s*:/i.test(html);
 }
@@ -530,7 +582,7 @@ function parseMetadata(html, pageUrl) {
 
 function pushUnique(arr, value) {
     value = normalizeUrl(value);
-    if (!isHttpUrl(value)) return;
+    if (!isDirectMediaUrl(value)) return;
     if (arr.indexOf(value) >= 0) return;
     if (arr.length >= MAX_SOURCES) return;
     arr.push(value);
@@ -545,7 +597,7 @@ function collectHlsUrls(meta) {
     if (!safeObj(meta)) return [];
     let hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls || "";
     let url = normalizeUrl(hls, "https://ok.ru/");
-    return isM3u8Url(url) ? [url] : [];
+    return isM3u8Url(url) && isDirectMediaUrl(url) ? [url] : [];
 }
 
 // FIX (calidad de cast): OK.ru suele exponer varias URLs de video con una
@@ -591,7 +643,7 @@ function estimateBitrate(height) {
 
 function pushUniqueQuality(arr, url, label) {
     url = normalizeUrl(url);
-    if (!isHttpUrl(url)) return;
+    if (!isDirectMediaUrl(url)) return;
     for (let i = 0; i < arr.length; i++) {
         if (arr[i].url === url) return;
     }
@@ -651,7 +703,7 @@ function firstValue(obj, keys) {
 }
 
 function getTitle(meta, fallback, id) {
-    let v = cleanText(firstValue(meta, [
+    let v = unwrapOkTitle(firstValue(meta, [
         "title",
         "name",
         "movieTitle",
@@ -668,7 +720,15 @@ function getTitle(meta, fallback, id) {
         v = "";
     }
 
-    return v || cleanText(fallback) || "OK.ru video";
+    let fb = unwrapOkTitle(fallback);
+
+    // Si el metadata quedó con el wrapper de OK.ru, preferí el título
+    // limpio que vino de la búsqueda (?t=).
+    if (v && /see video|video player/i.test(v) && fb) {
+        return fb;
+    }
+
+    return v || fb || "OK.ru video";
 }
 
 function getPoster(meta) {
@@ -1041,6 +1101,21 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         (mp4.length ? " labels=[" + mp4Labels.join(",") + "]" : ""));
     if (hls.length > 0) addDebug("hls[0] url=" + hls[0]);
 
+    if (hls.length === 0 && mp4.length === 0) {
+        let yt = extractYouTubeId(html);
+        if (!yt) {
+            try { yt = extractYouTubeId(JSON.stringify(meta)); } catch (_) {}
+        }
+        if (yt) {
+            throw new Error(
+                "Este video en OK.ru es un embed de YouTube. " +
+                "Abrilo con la fuente YouTube de GrayJay:\n" +
+                youtubeWatchUrl(yt)
+            );
+        }
+        throw new Error("OK.ru no entregó HLS ni MP4 reproducible.\n" + debugText());
+    }
+
     /*
      * RUTA RÁPIDA:
      * No descargamos el master .m3u8 desde JS. Esa petición agrega latencia
@@ -1067,20 +1142,9 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
-    if (bestMp4Index >= 0 && bestMp4Order >= 70) {
-        let bestSrc = makeMp4Source(
-            mp4[bestMp4Index].url,
-            duration,
-            bestMp4Index,
-            mp4[bestMp4Index].label
-        );
-        if (bestSrc) {
-            sources.push(bestSrc);
-            addDebug("CAST primary: MP4 " + (mp4[bestMp4Index].label || "?"));
-        }
-    }
-
-    // HLS master directo, sin round-trip adicional.
+    // HLS primero: en varios videos el MP4 aparece en la lista de
+    // calidades pero el CDN no lo entrega (firma/expiración). El master
+    // HLS suele ser el que sí arranca en el player local.
     for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
         let src = makeHlsSource(hls[i], duration);
         if (src) {
@@ -1089,9 +1153,7 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
-    // El resto de MP4 queda como fallback.
     for (let j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
-        if (j === bestMp4Index) continue;
         let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
         if (src) sources.push(src);
     }
@@ -1188,10 +1250,9 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     if (!id || seen[id] || results.length >= 96) return;
     block = safeStr(block);
 
-    // Do not expose an OK.ru item whose actual player is an external provider.
-    if (containsExternalVideoEmbed(block)) return;
+    let youtubeId = extractYouTubeId(block);
 
-    let title = cleanText(anchorTitle || "");
+    let title = unwrapOkTitle(anchorTitle || "");
 
     if (!title || title.length < 2) {
         let tm = block.match(
@@ -1238,14 +1299,17 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     // llamada posterior a getContentDetails(). Para no depender de eso, el
     // título viaja directamente adentro de la URL que se le entrega a
     // GrayJay; es la misma URL que después vuelve en getContentDetails(url).
-    let urlWithTitle =
-        "https://ok.ru/video/" + id +
-        (!/^OK\.ru video\b/i.test(title)
-            ? "?t=" + encodeURIComponent(title)
-            : "");
+    // Si OK.ru solo embebe YouTube, la tarjeta apunta al watch de YouTube
+    // para que la fuente oficial de GrayJay lo reproduzca.
+    let urlWithTitle = youtubeId
+        ? youtubeWatchUrl(youtubeId)
+        : ("https://ok.ru/video/" + id +
+            (!/^OK\.ru video\b/i.test(title)
+                ? "?t=" + encodeURIComponent(title)
+                : ""));
 
     results.push({
-        id: id,
+        id: youtubeId ? ("yt:" + youtubeId) : id,
         url: urlWithTitle,
         title: title,
         thumbnail: poster,
@@ -1464,9 +1528,7 @@ function isGenericSiteTitle(t) {
 function extractPageTitle(html) {
     let m = safeStr(html).match(/<title[^>]*>([^<]+)<\/title>/i);
     if (m) {
-        let t = cleanText(m[1])
-            .replace(/\s*[|\-–]\s*OK\.?RU.*$/i, "")
-            .trim();
+        let t = unwrapOkTitle(m[1]);
         if (!isGenericSiteTitle(t)) return t;
     }
 
@@ -1474,7 +1536,7 @@ function extractPageTitle(html) {
         /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
     );
     if (m) {
-        let t = cleanText(m[1]);
+        let t = unwrapOkTitle(m[1]);
         if (!isGenericSiteTitle(t)) return t;
     }
 
