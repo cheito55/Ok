@@ -1,6 +1,14 @@
 /*
- * GrayJay - OK.ru Source v34
+ * GrayJay - OK.ru Source v35
  *
+ * v35 (HLS no arrancaba, MP4 sí):
+ *   - HLS vuelve a mandar Referer + User-Agent + Origin (igual que exOkRu de
+ *     PlayPelis). MP4 sigue SIN Origin (así ya reproducía).
+ *   - HLS_DIAG: junto al master se ofrecen 2 variantes de prueba en el menú de
+ *     calidad: "sin Origin" y "sin headers", para ver cuál arranca.
+ *   - Orden: MP4 primero si existe (PREFER_HLS_FIRST=false), HLS como alternativa.
+ *
+ * v34:
  * v34:
  *   - Extracción: se prueba data-options que contenga "flashvars" (en la página
  *     completa /video/<id> el primero suele ser de otro módulo, no del player).
@@ -965,20 +973,21 @@ const ENABLE_SOURCE_HEADERS = true;
 // Orden de fuentes. false = comportamiento worker-cast (MP4 HD primero si la
 // calidad es conocida, luego HLS). true = HLS master primero (útil si algún
 // video con MP4 enorme no arranca).
-const PREFER_HLS_FIRST = true;
+const PREFER_HLS_FIRST = false;
+const HLS_DIAG = true;
 // Origin no es necesario para el reproductor y algunos CDN de OK.ru lo
 // rechazan en determinadas URLs firmadas. Referer/UA se conservan.
-const SEND_ORIGIN_TO_PLAYER = false;
+const SEND_ORIGIN_TO_PLAYER = true; // solo para HLS
 const SEND_COOKIE_TO_VIDEO_PLAYER = false;
 
-function okRequestModifier() {
+function okRequestModifier(withOrigin) {
     // SEND_COOKIE_TO_VIDEO_PLAYER queda false deliberadamente para probar
     // si el CDN acepta las URLs firmadas sin sesión durante reproducción.
     let h = {
         "User-Agent": UA_DESKTOP,
         "Referer": "https://ok.ru/"
     };
-    if (SEND_ORIGIN_TO_PLAYER) h["Origin"] = "https://ok.ru";
+    if (withOrigin) h["Origin"] = "https://ok.ru";
     
     // IMPORTANTE: no mandar la sesión al player / Chromecast.
     // La cookie queda reservada para extracción/metadata; las fuentes que
@@ -994,14 +1003,17 @@ function okRequestModifier() {
     };
 }
 
-function makeHlsSource(url, duration) {
+function makeHlsSource(url, duration, mode) {
+    // mode: undefined/"full" = UA+Referer+Origin; "noorigin"; "none" = sin requestModifier
     try {
         let opts = {
             name: "OK.ru HLS",
             duration: duration || 0,
             url: url
         };
-        if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier();
+        if (ENABLE_SOURCE_HEADERS && mode !== "none") {
+            opts.requestModifier = okRequestModifier(mode === "noorigin" ? false : SEND_ORIGIN_TO_PLAYER);
+        }
         return new HLSSource(opts);
     } catch (e) {
         addDebug("makeHlsSource EXCEPTION: " + e);
@@ -1151,7 +1163,7 @@ function makeMp4Source(url, duration, index, label) {
             duration: duration || 0,
             url: url
         };
-        if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier();
+        if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier(false);
         return new VideoUrlSource(opts);
     } catch (e) {
         addDebug("makeMp4Source EXCEPTION: " + e);
@@ -1219,9 +1231,11 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
+    if (bestMp4Index < 0 && mp4.length > 0) bestMp4Index = 0;
+
     if (PREFER_HLS_FIRST) {
         addDebug("v33 source order: HLS first; MP4 fallback");
-    } else if (bestMp4Index >= 0 && bestMp4Order >= 70) {
+    } else if (bestMp4Index >= 0) {
         let bestSrc = makeMp4Source(
             mp4[bestMp4Index].url,
             duration,
@@ -1240,6 +1254,12 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         if (src) {
             src.name = i === 0 ? "OK.ru Auto HLS (Master)" : "OK.ru HLS " + (i + 1);
             sources.push(src);
+        }
+        if (HLS_DIAG && i === 0) {
+            let d1 = makeHlsSource(hls[i], duration, "noorigin");
+            if (d1) { d1.name = "OK.ru HLS diag: sin Origin"; sources.push(d1); }
+            let d2 = makeHlsSource(hls[i], duration, "none");
+            if (d2) { d2.name = "OK.ru HLS diag: sin headers"; sources.push(d2); }
         }
     }
 
