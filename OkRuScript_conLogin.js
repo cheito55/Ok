@@ -914,7 +914,7 @@ function xuperResolve(meta) {
 // - Plugins reales (Rumble, etc.) no ponen requestModifier en HLSSource.
 // - Con Origin/Referer/Cookie en el stream: a menudo 00:00 en player o Cast roto.
 // - ENABLE_SOURCE_HEADERS=false = mismo comportamiento que OkRuScript_v12_CAST.
-const ENABLE_SOURCE_HEADERS = false; // CAST: headers en el stream rompen Chromecast y a veces el player
+const ENABLE_SOURCE_HEADERS = true; // CAST: headers en el stream rompen Chromecast y a veces el player
 // Orden de fuentes. false = comportamiento worker-cast (MP4 HD primero si la
 // calidad es conocida, luego HLS). true = HLS master primero (útil si algún
 // video con MP4 enorme no arranca).
@@ -928,18 +928,12 @@ const SEND_ORIGIN_TO_PLAYER = true; // solo para HLS
 const SEND_COOKIE_TO_VIDEO_PLAYER = false;
 
 function okRequestModifier(withOrigin) {
-    // SEND_COOKIE_TO_VIDEO_PLAYER queda false deliberadamente para probar
-    // si el CDN acepta las URLs firmadas sin sesión durante reproducción.
     let h = {
-        "User-Agent": UA_DESKTOP,
-        "Referer": "https://ok.ru/"
+        "User-Agent": UA_DESKTOP
+        // Se elimina Referer y Origin. Cast falla por políticas CORS 
+        // si se incluyen, y OK.ru solo bloquea el User-Agent de ExoPlayer.
     };
-    if (withOrigin) h["Origin"] = "https://ok.ru";
     
-    // IMPORTANTE: no mandar la sesión al player / Chromecast.
-    // La cookie queda reservada para extracción/metadata; las fuentes que
-    // recibe el reproductor y Chromecast salen sin Cookie.
-
     return {
         headers: h,
         modifyRequest: function (url, headers) {
