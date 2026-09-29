@@ -379,16 +379,18 @@ function httpGetAuthenticated(url) {
     }
 }
 
+function htmlLooksPlayable(html) {
+    html = safeStr(html);
+    if (!html) return false;
+    return /hlsManifestUrl|hlsMasterPlaylistUrl|ondemandHls/i.test(html) ||
+        /"videos"\s*:\s*\[\s*\{/i.test(html);
+}
+
 function loadOkPage(url, id) {
-    // IMPORTANTE: desde esta versión la Cookie queda EXCLUSIVAMENTE para
-    // la búsqueda de videos (fetchSearchPage/httpGetAuthenticated).
-    // La página del video y todo el proceso de extracción se consulta sin
-    // Cookie. Así las URLs que descubre el extractor quedan independientes
-    // de la sesión y luego pueden reproducirse/castearse sin Cookie.
-    //
-    // PRUEBA (v30): igual que exOkRu del simple, se prueba primero
-    // /videoembed/<id> (donde el data-options suele venir más directo) y
-    // si no responde nada se cae a /video/<id> (la url "canonical" de v29).
+    // Cookie SOLO en búsqueda. Acá se pide el player en público.
+    // Si /videoembed trae HTML pero sin streams (anuncio / stub), se
+    // cae a /video/<id>. Antes se aceptaba cualquier body del embed
+    // y esos videos "se detectaban" pero nunca arrancaban.
     let t0 = nowMs();
     let headers = {
         "User-Agent": UA_DESKTOP,
@@ -396,16 +398,23 @@ function loadOkPage(url, id) {
         "Origin": "https://ok.ru"
     };
 
-    let body = "";
+    let embed = "";
     if (id) {
-        body = httpGet("https://ok.ru/videoembed/" + id, headers);
+        embed = httpGet("https://ok.ru/videoembed/" + id, headers);
     }
-    if (!body) {
-        body = httpGet(url, headers);
+    if (htmlLooksPlayable(embed)) {
+        addDebug("OK page embed playable: " + (nowMs() - t0) + "ms");
+        return embed;
     }
 
-    addDebug("OK page public (no cookie): " + (nowMs() - t0) + "ms");
-    return body || "";
+    let page = httpGet(url, headers);
+    if (htmlLooksPlayable(page)) {
+        addDebug("OK page /video playable: " + (nowMs() - t0) + "ms");
+        return page;
+    }
+
+    addDebug("OK page fallback embed/page: " + (nowMs() - t0) + "ms");
+    return embed || page || "";
 }
 
 function tryParseJson(value) {
@@ -462,46 +471,78 @@ function tryParseJson(value) {
  * cual. Si no hay data-options/metadata, plan B: buscar "hlsManifestUrl"
  * directo en el texto de la página.
  */
+function fetchMetadataUrl(metaUrl) {
+    metaUrl = normalizeUrl(metaUrl, "https://ok.ru/");
+    if (!isHttpUrl(metaUrl)) return null;
+    addDebug("metadataUrl: " + metaUrl);
+    let body = httpGet(metaUrl, {
+        "User-Agent": UA_DESKTOP,
+        "Referer": "https://ok.ru/",
+        "Origin": "https://ok.ru"
+    });
+    let meta = tryParseJson(body);
+    if (meta) return meta;
+    body = httpPost(metaUrl, "", {
+        "User-Agent": UA_DESKTOP,
+        "Referer": "https://ok.ru/",
+        "Origin": "https://ok.ru"
+    });
+    return tryParseJson(body);
+}
+
+function scoreMeta(meta) {
+    if (!safeObj(meta)) return 0;
+    let s = 0;
+    if (meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls || meta.liveHls) s += 20;
+    if (Array.isArray(meta.videos)) {
+        for (let i = 0; i < meta.videos.length; i++) {
+            if (meta.videos[i] && meta.videos[i].url) s += 2;
+        }
+    }
+    if (safeObj(meta.movie) && meta.movie.title) s += 1;
+    return s;
+}
+
+function metaFromFlashvars(fv) {
+    if (!safeObj(fv)) return null;
+    let meta = fv.metadata;
+    if (typeof meta === "string") meta = tryParseJson(meta);
+    if (scoreMeta(meta) > 0) return meta;
+
+    let metaUrl = (safeObj(meta) && (meta.metadataUrl || meta.metadataURL)) ||
+        fv.metadataUrl || fv.metadataURL;
+    if (metaUrl) {
+        let fetched = fetchMetadataUrl(metaUrl);
+        if (scoreMeta(fetched) > 0) return fetched;
+        if (fetched) return fetched;
+    }
+    return safeObj(meta) ? meta : null;
+}
+
 function extractMetadataFromHtml(html) {
     html = safeStr(html);
     if (!html) return null;
 
-    let m = /data-options\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(html);
-    if (m) {
+    let best = null;
+    let bestScore = -1;
+    let found = 0;
+    let re = /data-options\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+        found++;
         let raw = m[1] !== undefined ? m[1] : m[2];
         let o = tryParseJson(raw);
-        let fv = o && o.flashvars;
-        if (fv) {
-            let meta = fv.metadata;
-            if (typeof meta === "string") meta = tryParseJson(meta);
-            if (meta) return meta;
-
-            let metaUrl = fv.metadataUrl || fv.metadataURL;
-            if (metaUrl) {
-                addDebug("metadataUrl: " + metaUrl);
-                let body = httpGet(normalizeUrl(metaUrl, "https://ok.ru/"), {
-                    "User-Agent": UA_DESKTOP,
-                    "Referer": "https://ok.ru/",
-                    "Origin": "https://ok.ru"
-                });
-                meta = tryParseJson(body);
-                if (meta) return meta;
-                body = httpPost(normalizeUrl(metaUrl, "https://ok.ru/"), "", {
-                    "User-Agent": UA_DESKTOP,
-                    "Referer": "https://ok.ru/",
-                    "Origin": "https://ok.ru"
-                });
-                meta = tryParseJson(body);
-                if (meta) return meta;
-            }
+        let meta = metaFromFlashvars(o && o.flashvars);
+        let sc = scoreMeta(meta);
+        if (sc > bestScore) {
+            bestScore = sc;
+            best = meta;
         }
-        addDebug("data-options presente pero sin metadata utilizable");
-    } else {
-        addDebug("sin data-options en la página");
+        if (sc >= 20) break;
     }
+    addDebug("data-options blocks=" + found + " bestScore=" + bestScore);
+    if (bestScore > 0) return best;
 
-    // Plan B: buscar la clave directo en el texto (sin pasar por JSON.parse
-    // del data-options completo).
     let t = htmlDecode(html).replace(/\\\//g, "/");
     let mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(t);
     if (mm) {
@@ -509,7 +550,7 @@ function extractMetadataFromHtml(html) {
         return { hlsManifestUrl: cleanUrl(mm[1]) };
     }
 
-    return null;
+    return best;
 }
 
 function parseMetadata(html, pageUrl) {
@@ -532,11 +573,31 @@ function pushUnique(arr, value) {
  * meta.hlsManifestUrl (o los alias que tambien usa OK.ru), sin recorrido
  * de arbol ni regex sobre todo el JSON.
  */
+function isHlsLikeUrl(url) {
+    url = cleanUrl(url);
+    if (!isHttpUrl(url)) return false;
+    if (isM3u8Url(url)) return true;
+    // OK CDN a veces entrega el master/variante sin .m3u8 en el path.
+    return /okcdn\.ru/i.test(url) &&
+        (/(?:[?&]type=2(?:&|$))|\/video\/?(?:$|[?#])|videoPlayerCdn/i.test(url));
+}
+
 function collectHlsUrls(meta) {
     if (!safeObj(meta)) return [];
-    let hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls || "";
-    let url = normalizeUrl(hls, "https://ok.ru/");
-    return isM3u8Url(url) ? [url] : [];
+    let keys = [
+        "hlsManifestUrl",
+        "hlsMasterPlaylistUrl",
+        "ondemandHls",
+        "liveHls",
+        "liveHlsManifestUrl",
+        "hlsUrl"
+    ];
+    let out = [];
+    for (let i = 0; i < keys.length; i++) {
+        let url = normalizeUrl(meta[keys[i]], "https://ok.ru/");
+        if (isHlsLikeUrl(url)) pushUnique(out, url);
+    }
+    return out;
 }
 
 // FIX (calidad de cast): OK.ru suele exponer varias URLs de video con una
@@ -846,8 +907,7 @@ function okRequestModifier() {
     // si el CDN acepta las URLs firmadas sin sesión durante reproducción.
     let h = {
         "User-Agent": UA_DESKTOP,
-        "Referer": "https://ok.ru/",
-        "Origin": "https://ok.ru"
+        "Referer": "https://ok.ru/"
     };
     
     // IMPORTANTE: no mandar la sesión al player / Chromecast.
@@ -864,12 +924,20 @@ function okRequestModifier() {
     };
 }
 
+function hintMediaUrl(url, ext) {
+    url = normalizeUrl(url);
+    if (!url) return url;
+    if (new RegExp("\\." + ext + "(?:$|[?#])", "i").test(url)) return url;
+    if (url.indexOf("#") >= 0) return url;
+    return url + "#." + ext;
+}
+
 function makeHlsSource(url, duration) {
     try {
         let opts = {
             name: "OK.ru HLS",
             duration: duration || 0,
-            url: url
+            url: hintMediaUrl(url, "m3u8")
         };
         if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier();
         return new HLSSource(opts);
@@ -1020,7 +1088,7 @@ function makeMp4Source(url, duration, index, label) {
             name: name,
             bitrate: q ? estimateBitrate(q.height) : 0,
             duration: duration || 0,
-            url: url
+            url: /okcdn\.ru/i.test(url) ? hintMediaUrl(url, "mp4") : url
         };
         if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier();
         return new VideoUrlSource(opts);
