@@ -559,31 +559,30 @@ function extractMetadataFromHtml(html) {
         let raw = m[1] !== undefined ? m[1] : m[2];
         let o = tryParseJson(raw);
         let fv = o && o.flashvars;
-                    if (fv) {
-                let meta = fv.metadata;
-                if (typeof meta === "string") meta = tryParseJson(meta);
+        if (fv) {
+            let meta = fv.metadata;
+            if (typeof meta === "string") meta = tryParseJson(meta);
+            if (meta) return meta;
+
+            let metaUrl = fv.metadataUrl || fv.metadataURL;
+            if (metaUrl) {
+                addDebug("metadataUrl: " + metaUrl);
+                let fullUrl = normalizeUrl(metaUrl, "https://ok.ru/");
+                let headers = {
+                    "User-Agent": UA_DESKTOP,
+                    "Referer": "https://ok.ru/",
+                    "Origin": "https://ok.ru"
+                };
+
+                // OPTIMIZACIÓN: POST primero
+                let body = httpPost(fullUrl, "", headers);
+                meta = tryParseJson(body);
                 if (meta) return meta;
 
-                let metaUrl = fv.metadataUrl || fv.metadataURL;
-                if (metaUrl) {
-                    addDebug("metadataUrl: " + metaUrl);
-                    let fullUrl = normalizeUrl(metaUrl, "https://ok.ru/");
-                    let headers = {
-                        "User-Agent": UA_DESKTOP,
-                        "Referer": "https://ok.ru/",
-                        "Origin": "https://ok.ru"
-                    };
-
-                    // OPTIMIZACIÓN: OK.ru ahora exige POST. Lo probamos primero para ahorrar un viaje de red fallido.
-                    let body = httpPost(fullUrl, "", headers);
-                    meta = tryParseJson(body);
-                    if (meta) return meta;
-
-                    // Fallback a GET solo por retrocompatibilidad extrema
-                    body = httpGet(fullUrl, headers);
-                    meta = tryParseJson(body);
-                    if (meta) return meta;
-                }
+                // Fallback a GET
+                body = httpGet(fullUrl, headers);
+                meta = tryParseJson(body);
+                if (meta) return meta;
             }
         }
         addDebug("data-options presente pero sin metadata utilizable");
@@ -591,8 +590,7 @@ function extractMetadataFromHtml(html) {
         addDebug("sin data-options en la página");
     }
 
-    // Plan B: buscar la clave directo en el texto (sin pasar por JSON.parse
-    // del data-options completo).
+    // Plan B: buscar la clave directo en el texto
     let t = htmlDecode(html).replace(/\\\//g, "/");
     let mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(t);
     if (mm) {
