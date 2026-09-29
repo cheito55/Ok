@@ -269,7 +269,7 @@ function extractExternalEmbed(value) {
 }
 
 function installPluginMessage(ext) {
-    return "Instale el plugin " + ext.plugin + " para reproducir este video.\n" + ext.url;
+    return "Este video está alojado en " + ext.plugin + ".\nGrayJay no permite salto automático desde esta pantalla. Copie el enlace o búsquelo en la plataforma original:\n" + ext.url;
 }
 
 function youtubeWatchUrl(id) {
