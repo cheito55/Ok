@@ -1,5 +1,5 @@
 /*
- * GrayJay - OK.ru Source v30 (PRUEBA: extractor simple estilo exOkRu)
+ * GrayJay - OK.ru Source v33 (base v32 SOLO SESIÓN; ver notas v33 abajo) / v30 (PRUEBA: extractor simple estilo exOkRu)
  *
  * A partir de v29, se reemplazó todo el recorrido genérico de árbol JSON
  * (findMetadataInObject, collectUrlsFromObject/String, etc.) por la
@@ -18,6 +18,14 @@
  * - Extracción de página/metadata y reproducción HLS/MP4 SIN Cookie.
  * - requestModifier (Referer/User-Agent de ok.ru, sin cookie) en las
  *   fuentes HLS/MP4 para que el cast a Chromecast funcione.
+ *
+ * v33: - Sin fuentes reproducibles ya no deja el player girando: lanza error
+ *         con diagnóstico (keys del metadata, videos[], provider, error).
+ *       - Se recorren todos los data-options (no solo el primero).
+ *       - Si /videoembed no da metadata, reintenta con /video/<id>.
+ *       - Fallback DASH (ondemandDash) si no hay HLS ni MP4.
+ *       - Búsqueda: un resultado con título genérico puede mejorarse si un
+ *         match posterior trae el título real (antes el primero lo congelaba).
  *
  * v32: SOLO SESIÓN. Sin Worker de Cloudflare ni cookies embebidas.
  *   - La búsqueda usa únicamente el Login nativo de GrayJay
@@ -521,42 +529,42 @@ function extractMetadataFromHtml(html) {
     html = safeStr(html);
     if (!html) return null;
 
-    let m = /data-options\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(html);
-    if (m) {
+    // v33: se recorren TODOS los data-options; el primero de la página no
+    // siempre es el del player (puede ser otro módulo sin flashvars).
+    let re = /data-options\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+    let m;
+    let count = 0;
+    let withFlashvars = 0;
+    while ((m = re.exec(html)) !== null) {
+        count++;
         let raw = m[1] !== undefined ? m[1] : m[2];
         let o = tryParseJson(raw);
         let fv = o && o.flashvars;
-        if (fv) {
-            let meta = fv.metadata;
-            if (typeof meta === "string") meta = tryParseJson(meta);
+        if (!fv) continue;
+        withFlashvars++;
+
+        let meta = fv.metadata;
+        if (typeof meta === "string") meta = tryParseJson(meta);
+        if (meta) return meta;
+
+        let metaUrl = fv.metadataUrl || fv.metadataURL;
+        if (metaUrl) {
+            addDebug("metadataUrl: " + metaUrl);
+            let hdrs = {
+                "User-Agent": UA_DESKTOP,
+                "Referer": "https://ok.ru/",
+                "Origin": "https://ok.ru"
+            };
+            let full = normalizeUrl(metaUrl, "https://ok.ru/");
+            meta = tryParseJson(httpGet(full, hdrs));
             if (meta) return meta;
-
-            let metaUrl = fv.metadataUrl || fv.metadataURL;
-            if (metaUrl) {
-                addDebug("metadataUrl: " + metaUrl);
-                let body = httpGet(normalizeUrl(metaUrl, "https://ok.ru/"), {
-                    "User-Agent": UA_DESKTOP,
-                    "Referer": "https://ok.ru/",
-                    "Origin": "https://ok.ru"
-                });
-                meta = tryParseJson(body);
-                if (meta) return meta;
-                body = httpPost(normalizeUrl(metaUrl, "https://ok.ru/"), "", {
-                    "User-Agent": UA_DESKTOP,
-                    "Referer": "https://ok.ru/",
-                    "Origin": "https://ok.ru"
-                });
-                meta = tryParseJson(body);
-                if (meta) return meta;
-            }
+            meta = tryParseJson(httpPost(full, "", hdrs));
+            if (meta) return meta;
         }
-        addDebug("data-options presente pero sin metadata utilizable");
-    } else {
-        addDebug("sin data-options en la página");
     }
+    addDebug("data-options: " + count + " bloques, con flashvars: " + withFlashvars);
 
-    // Plan B: buscar la clave directo en el texto (sin pasar por JSON.parse
-    // del data-options completo).
+    // Plan B: buscar la clave directo en el texto.
     let t = htmlDecode(html).replace(/\\\//g, "/");
     let mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(t);
     if (mm) {
@@ -1173,6 +1181,24 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         if (src) sources.push(src);
     }
 
+    // Diagnóstico: qué trajo realmente el metadata de este video.
+    try {
+        addDebug("meta keys: " + Object.keys(meta).join(","));
+        let vn = [];
+        if (Array.isArray(meta.videos)) {
+            for (let k = 0; k < meta.videos.length; k++) {
+                let v = meta.videos[k] || {};
+                vn.push(safeStr(v.name) + (v.disallowed ? "(disallowed)" : "") + (v.url ? "" : "(sin url)"));
+            }
+        }
+        addDebug("provider=" + safeStr(meta.provider) +
+            " error=" + safeStr(meta.error) +
+            " videos=[" + vn.join(",") + "]" +
+            " ondemandHls=" + (meta.ondemandHls ? "si" : "no") +
+            " ondemandDash=" + (meta.ondemandDash ? "si" : "no") +
+            " metadataEmbedded=" + (meta.metadataEmbedded ? "si" : "no"));
+    } catch (_) {}
+
     // Sin fuentes propias: si es un embed de otra plataforma, pedir el plugin.
     if (!sources.length) {
         let ext = extractExternalEmbed(html);
@@ -1180,6 +1206,27 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
             try { ext = extractExternalEmbed(JSON.stringify(meta)); } catch (_) {}
         }
         if (ext) throw makeErr(installPluginMessage(ext));
+    }
+
+    // v33: último recurso, DASH (algunos videos solo exponen MPD).
+    if (!sources.length) {
+        let dashUrl = normalizeUrl(meta.ondemandDash || meta.dashManifestUrl || "", "https://ok.ru/");
+        if (isHttpUrl(dashUrl)) {
+            try {
+                let dopts = { name: "OK.ru DASH", duration: duration || 0, url: dashUrl };
+                if (ENABLE_SOURCE_HEADERS) dopts.requestModifier = okRequestModifier();
+                sources.push(new DashSource(dopts));
+                addDebug("fallback DASH: " + dashUrl);
+            } catch (e) {
+                addDebug("DashSource EXCEPTION: " + e);
+            }
+        }
+    }
+
+    // v33: antes esto seguía con una lista vacía y el player quedaba girando
+    // para siempre sin decir nada. Ahora falla con el diagnóstico a la vista.
+    if (!sources.length) {
+        throw makeErr("OK.ru: este video no expone fuentes reproducibles.\n" + debugText());
     }
 
     let thumbs = [];
@@ -1270,31 +1317,50 @@ function parseDurationText(value) {
     return 0;
 }
 
-function addSearchCandidate(results, seen, id, block, anchorTitle) {
-    if (!id || seen[id] || results.length >= 96) return;
+function blockTitle(block) {
+    block = safeStr(block);
+    let t = "";
+    let tm = block.match(/(?:data-title|data-name|title)\s*=\s*["']([^"']{2,500})["']/i);
+    if (tm) t = cleanText(tm[1]);
+    if (!t || /^[\d:\s]*$/.test(t)) {
+        t = "";
+        tm = block.match(
+            /<(?:span|div|a)[^>]*class=["'][^"']*(?:title|name|caption)[^"']*["'][^>]*>([\s\S]{1,700}?)<\/(?:span|div|a)>/i
+        );
+        if (tm) t = cleanText(tm[1]);
+    }
+    return /^[\d:\s]*$/.test(t) ? "" : t;
+}
+
+function isGenericResultTitle(t) {
+    return /^OK\.ru video\b/i.test(safeStr(t));
+}
+
+function addSearchCandidate(results, seen, id, block, anchorTitle, anchorAttrs) {
+    if (!id) return;
+    let idx = seen[id] ? seen[id] - 1 : -1;
+
+    // Ya tiene título real: nada que mejorar.
+    if (idx >= 0 && !isGenericResultTitle(results[idx].title)) return;
+    if (idx < 0 && results.length >= 96) return;
+
     block = safeStr(block);
 
-    // Embeds de YouTube: se entregan con la URL de YouTube para que los abra
-    // el plugin de YouTube. Otros proveedores externos (vimeo, etc.) se omiten.
     let ext = extractExternalEmbed(block);
     if (!ext && containsExternalVideoEmbed(block)) return;
 
     let title = cleanText(anchorTitle || "");
+    // Un ancla que solo envuelve la miniatura suele traer "17:17" o números.
+    if (/^[\d:\s]*$/.test(title)) title = "";
 
-    if (!title || title.length < 2) {
-        let tm = block.match(
-            /(?:data-title|data-name|title)\s*=\s*["']([^"']{2,500})["']/i
-        );
-        if (tm) title = cleanText(tm[1]);
+    if (!title && anchorAttrs) {
+        let am = safeStr(anchorAttrs).match(/(?:title|aria-label)\s*=\s*["']([^"']{2,500})["']/i);
+        if (am) title = cleanText(am[1]);
     }
 
-    if (!title) {
-        let tm = block.match(
-            /<(?:span|div|a)[^>]*class=["'][^"']*(?:title|name|caption)[^"']*["'][^>]*>([\s\S]{1,700}?)<\/(?:span|div|a)>/i
-        );
-        if (tm) title = cleanText(tm[1]);
-    }
-
+    // La ventana de +-400 chars puede pisar el título de la tarjeta vecina, así
+    // que solo se usa como último recurso (ver blockTitle / segunda pasada).
+    let real = !!title;
     if (!title) title = "OK.ru video " + id;
 
     if (/^(image|video|more|next|previous|menu|play)$/i.test(title)) return;
@@ -1318,28 +1384,33 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     );
     if (dm) duration = parseDurationText(dm[1]);
 
-    seen[id] = true;
-    rememberTitle(id, title);
-
-    // FIX real: no dar por sentado que el motor de GrayJay mantiene el
-    // estado de este script (TITLE_CACHE) entre la llamada a search() y la
-    // llamada posterior a getContentDetails(). Para no depender de eso, el
-    // título viaja directamente adentro de la URL que se le entrega a
-    // GrayJay; es la misma URL que después vuelve en getContentDetails(url).
+    // El título viaja dentro de la URL (no depender de estado en memoria).
     let urlWithTitle = ext
         ? ext.url
-        : ("https://ok.ru/video/" + id +
-            (!/^OK\.ru video\b/i.test(title)
-                ? "?t=" + encodeURIComponent(title)
-                : ""));
+        : ("https://ok.ru/video/" + id + (real ? "?t=" + encodeURIComponent(title) : ""));
 
+    if (idx >= 0) {
+        // v33: ya existía con título genérico; solo se mejora si ahora hay uno real.
+        if (!real) return;
+        results[idx].title = title;
+        results[idx].url = urlWithTitle;
+        if (!results[idx].thumbnail && poster) results[idx].thumbnail = poster;
+        if (!results[idx].duration && duration) results[idx].duration = duration;
+        rememberTitle(id, title);
+        return;
+    }
+
+    rememberTitle(id, title);
     results.push({
         id: ext ? (ext.plugin.toLowerCase() + ":" + ext.id) : id,
         url: urlWithTitle,
         title: title,
         thumbnail: poster,
-        duration: duration
+        duration: duration,
+        _block: real ? "" : block.substring(0, 1200),
+        _ext: ext
     });
+    seen[id] = results.length; // índice + 1
 }
 
 function extractSearchResults(html) {
@@ -1357,7 +1428,8 @@ function extractSearchResults(html) {
         addSearchCandidate(
             results, seen, m[2],
             html.substring(start, end),
-            m[3]
+            m[3],
+            m[1]
         );
     }
 
@@ -1395,6 +1467,30 @@ function extractSearchResults(html) {
             html.substring(start, end),
             ""
         );
+    }
+
+    // Segunda pasada: los que siguen sin título real usan la ventana de bloque.
+    for (let i = 0; i < results.length; i++) {
+        let r = results[i];
+        // Solo si la ventana contiene únicamente este video (si aparece otro
+        // id, el texto podría ser de la tarjeta vecina y es mejor dejarlo genérico).
+        let othersInBlock = false;
+        if (r._block) {
+            let re5 = /\/(?:video|videoembed)\/(\d+)/g, m5;
+            while ((m5 = re5.exec(r._block)) !== null) {
+                if (m5[1] !== r.id && !r._ext) { othersInBlock = true; break; }
+            }
+        }
+        if (isGenericResultTitle(r.title) && r._block && !othersInBlock) {
+            let t = blockTitle(r._block);
+            if (t) {
+                r.title = t;
+                if (!r._ext) r.url = "https://ok.ru/video/" + r.id + "?t=" + encodeURIComponent(t);
+                rememberTitle(r.id, t);
+            }
+        }
+        delete r._block;
+        delete r._ext;
     }
 
     return results;
@@ -1591,6 +1687,19 @@ function doDetails(url) {
     }
 
     let meta = parseMetadata(html, canonical);
+
+    if (!meta) {
+        addDebug("sin metadata en videoembed, reintento con /video/");
+        let html2 = httpGet(canonical, {
+            "User-Agent": UA_DESKTOP,
+            "Referer": "https://ok.ru/",
+            "Origin": "https://ok.ru"
+        });
+        if (html2) {
+            html = html2;
+            meta = parseMetadata(html2, canonical);
+        }
+    }
 
     if (!meta) {
         throw new Error(
