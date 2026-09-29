@@ -10,16 +10,22 @@
  *     si no vino inline, se pide flashvars.metadataUrl
  *   - el HLS es directo: meta.hlsManifestUrl / hlsMasterPlaylistUrl / ondemandHls
  *   - el MP4 es directo: meta.videos = [{name, url}, ...]
- * Se mantiene todo lo demás de v29 (búsqueda con sesión, extractor,
+ * Se mantiene todo lo demás de v29 (búsqueda con sesión,
  * requestModifier con Referer/UA de ok.ru sin cookie para que funcione
  * el cast, ranking de calidad QUALITY_RANK, bindings de GrayJay).
  *
- * - Sesión: login nativo de GrayJay (bloque authentication del config).
- *   http.GET(..., true) usa la cookie del usuario. Sin Worker.
  * - Cookie de sesión usada SOLO en la búsqueda de videos.
  * - Extracción de página/metadata y reproducción HLS/MP4 SIN Cookie.
  * - requestModifier (Referer/User-Agent de ok.ru, sin cookie) en las
  *   fuentes HLS/MP4 para que el cast a Chromecast funcione.
+ *
+ * v32: SOLO SESIÓN. Sin Worker de Cloudflare ni cookies embebidas.
+ *   - La búsqueda usa únicamente el Login nativo de GrayJay
+ *     (http.GET(..., true)). Sin sesión: "Inicie sesión para encontrar videos".
+ *   - Embeds de otras plataformas (YouTube, Vimeo, Dailymotion, Rutube) se
+ *     derivan a su plugin con la URL original. Si el plugin no está
+ *     instalado: "Instale el plugin <Nombre> para reproducir este video".
+ *   - Extractor, orden de fuentes y cast: igual que worker-cast.
  *
  * Hybrid: original v5 search/details contract + explicit GrayJay session auth.
  *
@@ -223,7 +229,13 @@ function isExternalProvider(url) {
 
 
 function containsExternalVideoEmbed(value) {
-    return !!extractYouTubeId(value);
+    let x = safeStr(value)
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/gi, "&");
+
+    return /(?:youtube(?:-nocookie)?\.com|youtu\.be|vimeo\.com)/i.test(x) &&
+           /(?:iframe|embed|externalVideo|externalVideoId|youtubeId|youtubeVideoId|playerResponse|watch\?v=|youtube(?:-nocookie)?\.com\/(?:embed|watch|shorts|live|v)|youtu\.be\/)/i.test(x);
 }
 
 function extractYouTubeId(value) {
@@ -231,8 +243,7 @@ function extractYouTubeId(value) {
         .replace(/\\u002F/gi, "/")
         .replace(/\\\//g, "/")
         .replace(/&amp;/gi, "&");
-
-    // Evitar falsos positivos del player de OK ("paths":{"youtube"...}).
+    // Patrones estrictos: evita falsos positivos del player de OK ("paths":{"youtube"...}).
     let patterns = [
         /(?:youtube(?:-nocookie)?\.com\/(?:embed|shorts|live|v)\/)([A-Za-z0-9_-]{11})/i,
         /(?:youtube(?:-nocookie)?\.com\/watch\?(?:[^"'<>]*&)?v=)([A-Za-z0-9_-]{11})/i,
@@ -244,6 +255,40 @@ function extractYouTubeId(value) {
         if (m) return m[1];
     }
     return "";
+}
+
+// Plataformas externas embebidas en OK.ru -> plugin al que se deriva.
+function extractExternalEmbed(value) {
+    let x = safeStr(value)
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/gi, "&");
+
+    let yt = extractYouTubeId(x);
+    if (yt) return { plugin: "YouTube", id: yt, url: youtubeWatchUrl(yt) };
+
+    let m = x.match(/player\.vimeo\.com\/video\/(\d{5,12})|vimeo\.com\/(?:video\/)?(\d{5,12})/i);
+    if (m) {
+        let id = m[1] || m[2];
+        return { plugin: "Vimeo", id: id, url: "https://vimeo.com/" + id };
+    }
+
+    m = x.match(/dailymotion\.com\/(?:embed\/)?video\/([A-Za-z0-9]{5,10})|dai\.ly\/([A-Za-z0-9]{5,10})/i);
+    if (m) {
+        let id = m[1] || m[2];
+        return { plugin: "Dailymotion", id: id, url: "https://www.dailymotion.com/video/" + id };
+    }
+
+    m = x.match(/rutube\.ru\/(?:play\/embed|video)\/([a-f0-9]{32})/i);
+    if (m) {
+        return { plugin: "Rutube", id: m[1], url: "https://rutube.ru/video/" + m[1] + "/" };
+    }
+
+    return null;
+}
+
+function installPluginMessage(ext) {
+    return "Instale el plugin " + ext.plugin + " para reproducir este video.\n" + ext.url;
 }
 
 function youtubeWatchUrl(id) {
@@ -293,8 +338,7 @@ function httpGet(url, headers) {
 
         mergeHeaders(h, headers);
 
-        // false = sin sesión. La cookie de GrayJay solo se usa en la búsqueda.
-        let r = http.GET(url, h, false);
+        let r = http.GET(url, h);
         if (!r) return "";
 
         let body = "";
@@ -331,7 +375,7 @@ function httpPost(url, body, headers) {
         };
         mergeHeaders(h, headers);
 
-        let r = http.POST(url, body || "", h, false);
+        let r = http.POST(url, body || "", h);
         if (!r) return "";
 
         let respBody = "";
@@ -347,40 +391,51 @@ function httpPost(url, body, headers) {
     }
 }
 
+function looksLikeSearchResults(html) {
+    return /\/(?:video|videoembed)\/\d+/i.test(safeStr(html));
+}
+
+function readBody(r) {
+    let body = "";
+    if (!r) return body;
+    try { body = r.body; } catch (_) {}
+    if (!body) { try { body = r.getBody(); } catch (_) {} }
+    body = safeStr(body);
+    if (body.length > MAX_HTML_SIZE) body = body.substring(0, MAX_HTML_SIZE);
+    return body;
+}
+
+function makeErr(msg) {
+    try { return new ScriptException(msg); } catch (_) { return new Error(msg); }
+}
+
+var LOGIN_MSG = "Inicie sesión para encontrar videos";
+
+function looksLikeLoginWall(html) {
+    return /st\.cmd=anonym|anonymLogin|anonymMain|st\.email|st\.password|field_email|unite a ok|únete a ok|join ok|log in to ok|войти в одноклассники/i
+        .test(safeStr(html));
+}
+
+// Solo sesión del Login nativo de GrayJay. Lanza LOGIN_MSG si no hay sesión.
 function httpGetAuthenticated(url) {
+    let headers = {
+        "User-Agent": UA_DESKTOP,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
+        "Referer": "https://ok.ru/"
+    };
+    let r;
     try {
-        let headers = {
-            "User-Agent": UA_DESKTOP,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
-            "Referer": "https://ok.ru/"
-        };
-        // true = sesión del usuario en GrayJay (Login de la fuente).
-        let r = http.GET(url, headers, true);
-        if (!r) return "";
-
-        let body = "";
-        try {
-            body = r.body;
-        } catch (_) {}
-
-        if (!body) {
-            try {
-                body = r.getBody();
-            } catch (_) {}
-        }
-
-        body = safeStr(body);
-        if (body.length > MAX_HTML_SIZE) body = body.substring(0, MAX_HTML_SIZE);
-        return body;
+        r = http.GET(url, headers, true);
     } catch (e) {
-        addDebug("authenticated GET: " + e);
-        return "";
+        addDebug("search: sesión GrayJay no disponible: " + e);
+        throw makeErr(LOGIN_MSG);
     }
+    return readBody(r);
 }
 
 function loadOkPage(url, id) {
-    // IMPORTANTE: desde esta versión la Cookie queda EXCLUSIVAMENTE para
+    // IMPORTANTE: desde esta versión la sesión queda EXCLUSIVAMENTE para
     // la búsqueda de videos (fetchSearchPage/httpGetAuthenticated).
     // La página del video y todo el proceso de extracción se consulta sin
     // Cookie. Así las URLs que descubre el extractor quedan independientes
@@ -642,8 +697,7 @@ function firstValue(obj, keys) {
 }
 
 function getTitle(meta, fallback, id) {
-    // En este tipo de video el nombre viene en meta.movie.title,
-    // no en meta.title (que a veces está vacío o es el wrapper).
+    // En muchos videos el nombre viene en meta.movie.title.
     let v = "";
     if (safeObj(meta) && safeObj(meta.movie)) {
         v = cleanText(meta.movie.title || meta.movie.name || "");
@@ -669,8 +723,7 @@ function getTitle(meta, fallback, id) {
 
     let fb = cleanText(fallback);
 
-    // OK.ru manda title = See video "Nombre" on OK. Video Player
-    // Eso no tiene que ver con la cookie. Preferimos el nombre de la búsqueda.
+    // OK.ru a veces manda: See video "Nombre" on OK. Video Player
     let wrapped = /see video\s+["«“'](.+?)["»”']/i.exec(v);
     if (wrapped) v = cleanText(wrapped[1]);
     if (/see video|on ok\.?\s*video player/i.test(v) && fb && !/see video/i.test(fb)) {
@@ -715,8 +768,8 @@ function getDuration(meta) {
     let n = parseFloat(v);
     if (!isFinite(n) || n <= 0) return 0;
 
-    // GrayJay expects seconds. OK.ru movie.duration ya viene en segundos
-    // (ej. 1037 = 17 min). Solo ms si es un número enorme.
+    // GrayJay espera segundos. movie.duration de OK.ru ya viene en segundos
+    // (ej. 1037 = 17 min); solo se divide si es un número enorme (ms).
     if (n > 100000) n = n / 1000;
 
     return Math.round(n);
@@ -839,6 +892,10 @@ function xuperResolve(meta) {
 // que el CDN de OK.ru no tolera en el player nativo). Si sigue sin arrancar
 // en false también, el problema es otra cosa (la URL en sí, la cookie, etc.).
 const ENABLE_SOURCE_HEADERS = true;
+// Orden de fuentes. false = comportamiento worker-cast (MP4 HD primero si la
+// calidad es conocida, luego HLS). true = HLS master primero (útil si algún
+// video con MP4 enorme no arranca).
+const PREFER_HLS_FIRST = false;
 const SEND_COOKIE_TO_VIDEO_PLAYER = false;
 
 function okRequestModifier() {
@@ -920,7 +977,7 @@ function fetchTextWithOkHeaders(url) {
         };
         // Sin Cookie deliberadamente: esto es lectura del manifest durante
         // la extracción de variantes, no búsqueda.
-        let r = http.GET(url, headers, false);
+        let r = http.GET(url, headers);
         if (!r) return "";
         let body = "";
         try { body = r.body; } catch (_) {}
@@ -1005,7 +1062,6 @@ function makeMp4Source(url, duration, index, label) {
         if (/\.m4v(?:$|[?#])/.test(lower)) container = "m4v";
         else if (/\.webm(?:$|[?#])/.test(lower)) container = "webm";
         else if (/\.mov(?:$|[?#])/.test(lower)) container = "mov";
-        else if (/okcdn\.ru/i.test(lower)) container = "mp4";
 
         let q = qualityInfo(label);
         let name = q
@@ -1074,8 +1130,34 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
      */
     let sources = [];
 
-    // HLS primero: en videos como 9132112939654 el MP4 de okcdn no tiene
-    // .mp4 y pesa cientos de MB; el player lista calidades y no arranca.
+    let bestMp4Index = -1;
+    let bestMp4Order = -1;
+
+    for (let j = 0; j < mp4.length; j++) {
+        let q = qualityInfo(mp4[j].label);
+        let order = q ? q.order : -1;
+        if (order > bestMp4Order) {
+            bestMp4Order = order;
+            bestMp4Index = j;
+        }
+    }
+
+    if (PREFER_HLS_FIRST) bestMp4Index = -1;
+
+    if (bestMp4Index >= 0 && bestMp4Order >= 70) {
+        let bestSrc = makeMp4Source(
+            mp4[bestMp4Index].url,
+            duration,
+            bestMp4Index,
+            mp4[bestMp4Index].label
+        );
+        if (bestSrc) {
+            sources.push(bestSrc);
+            addDebug("CAST primary: MP4 " + (mp4[bestMp4Index].label || "?"));
+        }
+    }
+
+    // HLS master directo, sin round-trip adicional.
     for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
         let src = makeHlsSource(hls[i], duration);
         if (src) {
@@ -1084,22 +1166,20 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
+    // El resto de MP4 queda como fallback.
     for (let j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
+        if (j === bestMp4Index) continue;
         let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
         if (src) sources.push(src);
     }
 
+    // Sin fuentes propias: si es un embed de otra plataforma, pedir el plugin.
     if (!sources.length) {
-        let yt = extractYouTubeId(html);
-        if (!yt) {
-            try { yt = extractYouTubeId(JSON.stringify(meta)); } catch (_) {}
+        let ext = extractExternalEmbed(html);
+        if (!ext) {
+            try { ext = extractExternalEmbed(JSON.stringify(meta)); } catch (_) {}
         }
-        if (yt) {
-            throw new Error(
-                "Este item es un embed de YouTube. Abrilo con la fuente YouTube:\n" +
-                youtubeWatchUrl(yt)
-            );
-        }
+        if (ext) throw makeErr(installPluginMessage(ext));
     }
 
     let thumbs = [];
@@ -1194,7 +1274,10 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     if (!id || seen[id] || results.length >= 96) return;
     block = safeStr(block);
 
-    let youtubeId = extractYouTubeId(block);
+    // Embeds de YouTube: se entregan con la URL de YouTube para que los abra
+    // el plugin de YouTube. Otros proveedores externos (vimeo, etc.) se omiten.
+    let ext = extractExternalEmbed(block);
+    if (!ext && containsExternalVideoEmbed(block)) return;
 
     let title = cleanText(anchorTitle || "");
 
@@ -1243,15 +1326,15 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     // llamada posterior a getContentDetails(). Para no depender de eso, el
     // título viaja directamente adentro de la URL que se le entrega a
     // GrayJay; es la misma URL que después vuelve en getContentDetails(url).
-    let urlWithTitle = youtubeId
-        ? youtubeWatchUrl(youtubeId)
+    let urlWithTitle = ext
+        ? ext.url
         : ("https://ok.ru/video/" + id +
             (!/^OK\.ru video\b/i.test(title)
                 ? "?t=" + encodeURIComponent(title)
                 : ""));
 
     results.push({
-        id: youtubeId ? ("yt:" + youtubeId) : id,
+        id: ext ? (ext.plugin.toLowerCase() + ":" + ext.id) : id,
         url: urlWithTitle,
         title: title,
         thumbnail: poster,
@@ -1361,11 +1444,15 @@ function fetchSearchPage(query, page) {
     let url = SEARCH_URL_BASE + encodeURIComponent(safeStr(query));
     if (page > 1) url += "&st.page=" + page;
 
-    // OK.ru: la búsqueda usa la sesión del Login de GrayJay.
+    // La búsqueda de OK.ru exige sesión: se usa la del Login de GrayJay.
     let html = httpGetAuthenticated(url);
-    if (!html) html = httpGet(url);
-
     addDebug("search page " + page + " bytes=" + (html ? html.length : 0));
+
+    let hasVideos = /\/(?:video|videoembed)\/\d+/i.test(safeStr(html));
+    if (!hasVideos && (page <= 1 || looksLikeLoginWall(html))) {
+        // Sin enlaces a videos en la primera página (o pared de login): no hay sesión.
+        throw makeErr(LOGIN_MSG);
+    }
     return html || "";
 }
 
