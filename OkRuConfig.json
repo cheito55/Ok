@@ -1,7 +1,7 @@
 {
   "name": "OK.ru",
-  "description": "Plugin no oficial para reproducir videos de OK.ru (Odnoklassniki) dentro de GrayJay. Requiere login de tu cuenta para buscar.",
-  "author": "Lucas",
+  "description": "Plugin para reproducir videos de OK.ru (Odnoklassniki) dentro de GrayJay. Requiere login de tu cuenta para buscar.",
+  "author": "cheito55",
   "authorUrl": "",
   "platformUrl": "https://ok.ru",
   "sourceUrl": "https://raw.githubusercontent.com/cheito55/Ok/main/OkRuConfig.json",
