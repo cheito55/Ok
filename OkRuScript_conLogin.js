@@ -559,31 +559,31 @@ function extractMetadataFromHtml(html) {
         let raw = m[1] !== undefined ? m[1] : m[2];
         let o = tryParseJson(raw);
         let fv = o && o.flashvars;
-        if (fv) {
-            let meta = fv.metadata;
-            if (typeof meta === "string") meta = tryParseJson(meta);
-            if (meta) return meta;
-
-            let metaUrl = fv.metadataUrl || fv.metadataURL;
-                        let metaUrl = fv.metadataUrl || fv.metadataURL;
-            if (metaUrl) {
-                addDebug("metadataUrl: " + metaUrl);
-                let fullUrl = normalizeUrl(metaUrl, "https://ok.ru/");
-                let headers = {
-                    "User-Agent": UA_DESKTOP,
-                    "Referer": "https://ok.ru/",
-                    "Origin": "https://ok.ru"
-                };
-
-                // OPTIMIZACIÓN: OK.ru ahora exige POST. Lo probamos primero para ahorrar un viaje de red fallido.
-                let body = httpPost(fullUrl, "", headers);
-                meta = tryParseJson(body);
+                    if (fv) {
+                let meta = fv.metadata;
+                if (typeof meta === "string") meta = tryParseJson(meta);
                 if (meta) return meta;
 
-                // Fallback a GET solo por retrocompatibilidad extrema
-                body = httpGet(fullUrl, headers);
-                meta = tryParseJson(body);
-                if (meta) return meta;
+                let metaUrl = fv.metadataUrl || fv.metadataURL;
+                if (metaUrl) {
+                    addDebug("metadataUrl: " + metaUrl);
+                    let fullUrl = normalizeUrl(metaUrl, "https://ok.ru/");
+                    let headers = {
+                        "User-Agent": UA_DESKTOP,
+                        "Referer": "https://ok.ru/",
+                        "Origin": "https://ok.ru"
+                    };
+
+                    // OPTIMIZACIÓN: OK.ru ahora exige POST. Lo probamos primero para ahorrar un viaje de red fallido.
+                    let body = httpPost(fullUrl, "", headers);
+                    meta = tryParseJson(body);
+                    if (meta) return meta;
+
+                    // Fallback a GET solo por retrocompatibilidad extrema
+                    body = httpGet(fullUrl, headers);
+                    meta = tryParseJson(body);
+                    if (meta) return meta;
+                }
             }
         }
         addDebug("data-options presente pero sin metadata utilizable");
