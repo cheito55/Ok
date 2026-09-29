@@ -1,6 +1,14 @@
 /*
- * GrayJay - OK.ru Source v35
+ * GrayJay - OK.ru Source v36 (DIAGNÓSTICO HLS)
  *
+ * v36: ninguna variante HLS arrancaba (con/sin Origin, sin headers), así que
+ *   los headers no son la causa. Se agrega HLS_PROBE: al abrir un video con HLS,
+ *   el script pide el master desde JS (con y sin sesión, con distintos headers),
+ *   pide la primera variante y un trozo del primer segmento, y escribe el
+ *   resultado (código HTTP, tamaño, inicio del cuerpo) al principio de la
+ *   DESCRIPCIÓN del video en GrayJay. Con eso se ve dónde falla.
+ *
+ * v35:
  * v35 (HLS no arrancaba, MP4 sí):
  *   - HLS vuelve a mandar Referer + User-Agent + Origin (igual que exOkRu de
  *     PlayPelis). MP4 sigue SIN Origin (así ya reproducía).
@@ -487,6 +495,7 @@ function loadOkPage(url, id) {
                 collectMp4Urls(publicMeta).length > 0 ||
                 isM3u8Url(xuperResolve(publicMeta)))) {
                 addDebug("OK page public usable (no cookie): " + (nowMs() - t0) + "ms");
+                LAST_PAGE_MODE = "pública (sin sesión)";
                 return publicBody;
             }
             addDebug("OK public metadata sin fuente reproducible; pruebo sesión");
@@ -518,6 +527,7 @@ function loadOkPage(url, id) {
             if (!authFirst) authFirst = authBody;
             if (playable(authBody)) {
                 addDebug("OK auth playable via " + targets[ti] + ": " + (nowMs() - t0) + "ms");
+                LAST_PAGE_MODE = "CON sesión (" + targets[ti] + ")";
                 return authBody;
             }
             addDebug("OK auth sin fuentes en " + targets[ti]);
@@ -526,8 +536,9 @@ function loadOkPage(url, id) {
             break;
         }
     }
-    if (authFirst) return authFirst;
+    if (authFirst) { LAST_PAGE_MODE = "con sesión, sin fuentes"; return authFirst; }
 
+    LAST_PAGE_MODE = "pública, sin fuentes";
     addDebug("OK page public fallback: " + (nowMs() - t0) + "ms");
     return publicBody || "";
 }
@@ -975,6 +986,8 @@ const ENABLE_SOURCE_HEADERS = true;
 // video con MP4 enorme no arranca).
 const PREFER_HLS_FIRST = false;
 const HLS_DIAG = true;
+const HLS_PROBE = true;
+let LAST_PAGE_MODE = "";
 // Origin no es necesario para el reproductor y algunos CDN de OK.ru lo
 // rechazan en determinadas URLs firmadas. Referer/UA se conservan.
 const SEND_ORIGIN_TO_PLAYER = true; // solo para HLS
@@ -1173,6 +1186,101 @@ function makeMp4Source(url, duration, index, label) {
 }
 
 
+function probeShort(body) {
+    return safeStr(body).substring(0, 70).replace(/[^\x20-\x7e]+/g, " ").trim();
+}
+
+function probeMaskUrl(url) {
+    url = safeStr(url);
+    let host = getHost(url);
+    let keep = [];
+    let names = ["type", "ct", "clientType", "srcAg", "pr", "expires"];
+    for (let i = 0; i < names.length; i++) {
+        let m = url.match(new RegExp("[?&]" + names[i] + "=([^&]*)", "i"));
+        if (m) keep.push(names[i] + "=" + m[1]);
+    }
+    let path = url.replace(/^https?:\/\/[^/]+/i, "").split("?")[0];
+    return host + path + " ?" + keep.join("&") + (/[?&]sig=/i.test(url) ? " &sig=…" : " (SIN sig)");
+}
+
+function probeGet(url, headers, auth, range) {
+    let h = {};
+    for (let k in headers) h[k] = headers[k];
+    if (range) h["Range"] = "bytes=0-1023";
+    let r;
+    try {
+        r = auth ? http.GET(url, h, true) : http.GET(url, h);
+    } catch (e) {
+        return { code: "ERR", body: "", note: safeStr(e).substring(0, 60) };
+    }
+    let code = "?";
+    try { code = r.code; } catch (_) {}
+    let body = readBody(r);
+    return { code: code, body: body, note: "" };
+}
+
+function probeHls(masterUrl) {
+    let lines = [];
+    lines.push("[DIAG HLS v36] página: " + (LAST_PAGE_MODE || "?"));
+    lines.push("master: " + probeMaskUrl(masterUrl));
+
+    let base = { "User-Agent": UA_DESKTOP, "Referer": "https://ok.ru/", "Accept": "*/*" };
+    let withOrigin = { "User-Agent": UA_DESKTOP, "Referer": "https://ok.ru/", "Origin": "https://ok.ru", "Accept": "*/*" };
+    let tests = [
+        { n: "sin sesión, UA+Ref+Origin", h: withOrigin, a: false },
+        { n: "sin sesión, UA+Ref", h: base, a: false },
+        { n: "sin sesión, sin headers", h: {}, a: false },
+        { n: "CON sesión, UA+Ref", h: base, a: true }
+    ];
+
+    let best = null;
+    for (let i = 0; i < tests.length; i++) {
+        let t = tests[i];
+        let res = probeGet(masterUrl, t.h, t.a, false);
+        let isM3u = safeStr(res.body).indexOf("#EXTM3U") >= 0;
+        lines.push("master " + t.n + ": HTTP " + res.code + " len=" + safeStr(res.body).length +
+            (isM3u ? " M3U8-OK" : "") + " [" + probeShort(res.body) + "]" + (res.note ? " " + res.note : ""));
+        if (isM3u && !best) best = { body: res.body, t: t };
+    }
+
+    if (!best) {
+        lines.push("=> el master no se puede leer desde JS en ninguna variante");
+        return lines.join("\n");
+    }
+
+    // Primera línea de URL (variante o segmento).
+    let bl = best.body.split(/\r?\n/);
+    let next = "";
+    for (let i = 0; i < bl.length; i++) {
+        let l = bl[i].trim();
+        if (l && l.charAt(0) !== "#") { next = l; break; }
+    }
+    if (!next) { lines.push("master sin URIs"); return lines.join("\n"); }
+
+    let nextUrl = resolveM3u8Uri(next, masterUrl);
+    lines.push("sub-URL: " + probeMaskUrl(nextUrl));
+    let r2 = probeGet(nextUrl, best.t.h, best.t.a, false);
+    let isM3u2 = safeStr(r2.body).indexOf("#EXTM3U") >= 0;
+    lines.push("variante: HTTP " + r2.code + " len=" + safeStr(r2.body).length + (isM3u2 ? " M3U8-OK" : "") +
+        " [" + probeShort(r2.body) + "]");
+
+    if (isM3u2) {
+        let sl = r2.body.split(/\r?\n/);
+        let seg = "";
+        for (let i = 0; i < sl.length; i++) {
+            let l = sl[i].trim();
+            if (l && l.charAt(0) !== "#") { seg = l; break; }
+        }
+        if (seg) {
+            let segUrl = resolveM3u8Uri(seg, nextUrl);
+            lines.push("segmento: " + probeMaskUrl(segUrl));
+            let r3 = probeGet(segUrl, best.t.h, best.t.a, true);
+            lines.push("segmento (Range 1KB): HTTP " + r3.code + " len=" + safeStr(r3.body).length);
+        }
+    }
+    return lines.join("\n");
+}
+
 function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     if (!safeObj(meta)) throw new Error("No metadata");
 
@@ -1200,6 +1308,11 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     addDebug("sources hls=" + hls.length + " mp4=" + mp4.length +
         (mp4.length ? " labels=[" + mp4Labels.join(",") + "]" : ""));
     if (hls.length > 0) addDebug("hls[0] url=" + hls[0]);
+
+    let probeText = "";
+    if (HLS_PROBE && hls.length > 0) {
+        try { probeText = probeHls(hls[0]); } catch (pe) { probeText = "[DIAG HLS] error: " + pe; }
+    }
 
     /*
      * RUTA RÁPIDA:
@@ -1344,7 +1457,7 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         duration: duration,
         viewCount: 0,
         isLive: false,
-        description: getDescription(meta),
+        description: (probeText ? probeText + "\n\n" : "") + getDescription(meta),
         video: descriptor,
         dash: null,
         hls: firstHls,
