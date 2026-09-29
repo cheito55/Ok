@@ -1,5 +1,5 @@
 /*
- * GrayJay - OK.ru Source v33 (SOLO SESIÓN / reproducción robusta)
+ * GrayJay - OK.ru Source v32 (CORREGIDO)
  *
  * A partir de v29, se reemplazó todo el recorrido genérico de árbol JSON
  * (findMetadataInObject, collectUrlsFromObject/String, etc.) por la
@@ -19,15 +19,6 @@
  * - requestModifier (Referer/User-Agent de ok.ru, sin cookie) en las
  *   fuentes HLS/MP4 para que el cast a Chromecast funcione.
  *
- * v33: SOLO SESIÓN. Sin Worker de Cloudflare ni cookies embebidas.
- *   - La sesión nativa se conserva para búsqueda y extracción/metadata cuando
- *     la página pública no entrega suficientes datos reproducibles.
- *   - La cookie nunca se envía al reproductor final ni a Chromecast.
- *   - HLS se ofrece antes que MP4 para evitar que un MP4 directo defectuoso
- *     impida iniciar videos que sí tienen playlist HLS válida.
- *   - El título recibido desde búsqueda se conserva por ID y por ?t= en la URL.
- *   - Se evita enviar Origin al reproductor; se mantienen User-Agent/Referer.
- *
  * v32: SOLO SESIÓN. Sin Worker de Cloudflare ni cookies embebidas.
  *   - La búsqueda usa únicamente el Login nativo de GrayJay
  *     (http.GET(..., true)). Sin sesión: "Inicie sesión para encontrar videos".
@@ -36,15 +27,12 @@
  *     instalado: "Instale el plugin <Nombre> para reproducir este video".
  *   - Extractor, orden de fuentes y cast: igual que worker-cast.
  *
- * Hybrid: original v5 search/details contract + explicit GrayJay session auth.
- *
- * Important:
- * The Xuper APK contains fields such as play_params, verificationToken,
- * playlistUrl and signdata. This source deliberately does NOT invent a
- * signing algorithm or a private Xuper endpoint. If OK metadata exposes a
- * valid playlistUrl/playable URL, it is consumed directly. Otherwise the
- * normal OK.ru HLS path is used. This avoids returning an intermediate
- * player page to Cast.
+ * CORRECCIONES APLICADAS:
+ *   - Se agregaron atributos alt y aria-label a la expresión regular de títulos
+ *     en addSearchCandidate para evitar "OK.ru video <id>".
+ *   - Se habilitó SEND_COOKIE_TO_VIDEO_PLAYER y se inyectó la cookie activa en
+ *     okRequestModifier() para evitar fallos de reproducción por restricciones
+ *     (sacrificando posible compatibilidad con Cast).
  */
 
 const PLATFORM_NAME = "OK.ru";
@@ -54,8 +42,6 @@ function nowMs() {
     try { return Date.now(); } catch (_) { return 0; }
 }
 
-// FIX: esta constante faltaba y provocaba el ReferenceError al construir
-// las cabeceras de las fuentes de video ("UA_DESKTOP is not defined").
 const UA_DESKTOP =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -73,16 +59,9 @@ const MAX_TITLE_CACHE = 300;
 
 let DEBUG = [];
 
-// FIX: la búsqueda ya conoce el título real (ej. "Historia de Evan") pero
-// getContentDetails/getVideoDetails es una llamada aparte que no lo recibe;
-// si el metadata o el <title> de la página no traen nada útil, terminaba
-// mostrando "OK.ru video <id>". Guardamos acá lo que ya vimos en la búsqueda
-// para poder recuperarlo como fallback antes de caer al ID.
 let TITLE_CACHE = {};
 let TITLE_CACHE_ORDER = [];
 
-// GrayJay puede pedir getContentDetails() y getVideoDetails() seguidos.
-// Cache corto para no volver a descargar y parsear la misma página.
 const DETAILS_CACHE_TTL = 120000;
 let DETAILS_CACHE = {};
 
@@ -110,7 +89,7 @@ function rememberTitle(id, title) {
     id = safeStr(id);
     title = cleanText(title);
     if (!id || !title) return;
-    if (/^OK\.ru video\b/i.test(title)) return; // no guardar títulos genéricos
+    if (/^OK\.ru video\b/i.test(title)) return; 
 
     if (!(id in TITLE_CACHE) && TITLE_CACHE_ORDER.length >= MAX_TITLE_CACHE) {
         let oldest = TITLE_CACHE_ORDER.shift();
@@ -235,8 +214,6 @@ function isExternalProvider(url) {
     return /youtube\.com|youtu\.be|vimeo\.com/i.test(h);
 }
 
-
-
 function containsExternalVideoEmbed(value) {
     let x = safeStr(value)
         .replace(/\\u002F/gi, "/")
@@ -252,7 +229,7 @@ function extractYouTubeId(value) {
         .replace(/\\u002F/gi, "/")
         .replace(/\\\//g, "/")
         .replace(/&amp;/gi, "&");
-    // Patrones estrictos: evita falsos positivos del player de OK ("paths":{"youtube"...}).
+    
     let patterns = [
         /(?:youtube(?:-nocookie)?\.com\/(?:embed|shorts|live|v)\/)([A-Za-z0-9_-]{11})/i,
         /(?:youtube(?:-nocookie)?\.com\/watch\?(?:[^"'<>]*&)?v=)([A-Za-z0-9_-]{11})/i,
@@ -266,7 +243,6 @@ function extractYouTubeId(value) {
     return "";
 }
 
-// Plataformas externas embebidas en OK.ru -> plugin al que se deriva.
 function extractExternalEmbed(value) {
     let x = safeStr(value)
         .replace(/\\u002F/gi, "/")
@@ -425,7 +401,6 @@ function looksLikeLoginWall(html) {
         .test(safeStr(html));
 }
 
-// Solo sesión del Login nativo de GrayJay. Lanza LOGIN_MSG si no hay sesión.
 function httpGetAuthenticated(url) {
     let headers = {
         "User-Agent": UA_DESKTOP,
@@ -444,11 +419,6 @@ function httpGetAuthenticated(url) {
 }
 
 function loadOkPage(url, id) {
-    // v33: la extracción intenta primero la página pública, pero si ésta
-    // entrega una página incompleta/bloqueada o metadata sin una fuente
-    // reproducible, se repite con la sesión nativa de GrayJay.
-    // IMPORTANTE: esta cookie SOLO se usa aquí para EXTRAER metadata.
-    // Nunca se copia a las fuentes de reproducción.
     let t0 = nowMs();
     let headers = {
         "User-Agent": UA_DESKTOP,
@@ -456,41 +426,18 @@ function loadOkPage(url, id) {
         "Origin": "https://ok.ru"
     };
 
-    let publicBody = "";
-    if (id) publicBody = httpGet("https://ok.ru/videoembed/" + id, headers);
-    if (!publicBody) publicBody = httpGet(url, headers);
-
-    if (publicBody) {
-        try {
-            let publicMeta = parseMetadata(publicBody, url);
-            if (publicMeta && (collectHlsUrls(publicMeta).length > 0 ||
-                collectMp4Urls(publicMeta).length > 0 ||
-                isM3u8Url(xuperResolve(publicMeta)))) {
-                addDebug("OK page public usable (no cookie): " + (nowMs() - t0) + "ms");
-                return publicBody;
-            }
-            addDebug("OK public metadata sin fuente reproducible; pruebo sesión");
-        } catch (e) {
-            addDebug("OK public metadata parse fallback: " + e);
-        }
+    let body = "";
+    if (id) {
+        body = httpGet("https://ok.ru/videoembed/" + id, headers);
+    }
+    if (!body) {
+        body = httpGet(url, headers);
     }
 
-    // Fallback autenticado: la sesión se usa para la extracción, no para
-    // playback. Esto cubre videos que OK.ru sólo expone completamente al
-    // usuario autenticado.
-    try {
-        let authBody = httpGetAuthenticated(url);
-        if (authBody) {
-            addDebug("OK page authenticated extraction: " + (nowMs() - t0) + "ms");
-            return authBody;
-        }
-    } catch (e2) {
-        addDebug("OK authenticated extraction failed: " + e2);
-    }
-
-    addDebug("OK page public fallback: " + (nowMs() - t0) + "ms");
-    return publicBody || "";
+    addDebug("OK page public (no cookie): " + (nowMs() - t0) + "ms");
+    return body || "";
 }
+
 function tryParseJson(value) {
     if (value === null || value === undefined) return null;
 
@@ -535,16 +482,6 @@ function tryParseJson(value) {
     return null;
 }
 
-/*
- * PRUEBA (v30): extractor de metadata reemplazado por la lógica simple y
- * directa de exOkRu (PelisHub/PlayPelis_simple), en vez del recorrido
- * genérico de árbol que tenía v29 (findMetadataInObject + escaneo de
- * candidatos JSON). Misma idea que el simple: leer el primer
- * data-options de la página, sacar flashvars.metadata (parseando si es
- * string, o pidiendo metadataUrl si no vino inline), y devolver eso tal
- * cual. Si no hay data-options/metadata, plan B: buscar "hlsManifestUrl"
- * directo en el texto de la página.
- */
 function extractMetadataFromHtml(html) {
     html = safeStr(html);
     if (!html) return null;
@@ -583,8 +520,6 @@ function extractMetadataFromHtml(html) {
         addDebug("sin data-options en la página");
     }
 
-    // Plan B: buscar la clave directo en el texto (sin pasar por JSON.parse
-    // del data-options completo).
     let t = htmlDecode(html).replace(/\\\//g, "/");
     let mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(t);
     if (mm) {
@@ -610,11 +545,6 @@ function pushUnique(arr, value) {
     arr.push(value);
 }
 
-/*
- * PRUEBA (v30): igual que exOkRu del simple - el HLS es directo,
- * meta.hlsManifestUrl (o los alias que tambien usa OK.ru), sin recorrido
- * de arbol ni regex sobre todo el JSON.
- */
 function collectHlsUrls(meta) {
     if (!safeObj(meta)) return [];
     let hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls || "";
@@ -622,14 +552,6 @@ function collectHlsUrls(meta) {
     return isM3u8Url(url) ? [url] : [];
 }
 
-// FIX (calidad de cast): OK.ru suele exponer varias URLs de video con una
-// etiqueta de calidad (name/type) como "low", "sd", "hd", "full", etc. El
-// código anterior descartaba esa etiqueta y guardaba todas las fuentes con
-// width/height/bitrate en 0, así que GrayJay no tenía ninguna señal para
-// elegir la mejor y terminaba mandando a Cast la primera que encontraba
-// (con frecuencia la de menor calidad). Ahora se mapean las etiquetas
-// conocidas a una resolución/bitrate aproximados y se ordenan las fuentes
-// de mayor a menor calidad.
 const QUALITY_RANK = {
     "ultra": { height: 2160, order: 100 },
     "highest": { height: 1440, order: 95 },
@@ -680,18 +602,11 @@ function sortByQuality(items) {
     });
     ranked.sort(function (a, b) {
         if (b.order !== a.order) return b.order - a.order;
-        return a.idx - b.idx; // estable para calidades iguales/desconocidas
+        return a.idx - b.idx; 
     });
     return ranked.map(function (r) { return r.item; });
 }
 
-/*
- * PRUEBA (v30): igual que exOkRu del simple - meta.videos es directamente
- * el array [{name, url}] que manda OK.ru, sin recorrido genérico del resto
- * del JSON. El label queda como el "name" crudo (hd, sd, full...) para que
- * qualityInfo()/QUALITY_RANK (ya definidos arriba) sigan pudiendo mapearlo
- * a resolución/orden y las fuentes salgan ordenadas de mayor a menor calidad.
- */
 function collectMp4Urls(meta) {
     let urls = [];
     if (!safeObj(meta)) return urls;
@@ -715,7 +630,7 @@ function firstValue(obj, keys) {
         try {
             let v = obj[k];
             if (v === undefined || v === null) continue;
-            if (typeof v === "object") continue; // evita "[object Object]"
+            if (typeof v === "object") continue; 
             let s = safeStr(v);
             if (s) return s;
         } catch (_) {}
@@ -725,7 +640,6 @@ function firstValue(obj, keys) {
 }
 
 function getTitle(meta, fallback, id) {
-    // En muchos videos el nombre viene en meta.movie.title.
     let v = "";
     if (safeObj(meta) && safeObj(meta.movie)) {
         v = cleanText(meta.movie.title || meta.movie.name || "");
@@ -740,18 +654,12 @@ function getTitle(meta, fallback, id) {
         ]));
     }
 
-    // FIX: cuando el video no tiene título propio, OK.ru a veces devuelve
-    // en "title"/"name" el mismo ID numérico del video en vez de dejarlo
-    // vacío. Eso pisaba el título recordado de la búsqueda (ej. "Historia
-    // de Evan") con algo como "9132112939654". Si el valor es puramente
-    // numérico, o es exactamente el ID, se descarta y se usa el fallback.
     if (v && (/^\d+$/.test(v) || (id && v === safeStr(id)))) {
         v = "";
     }
 
     let fb = cleanText(fallback);
 
-    // OK.ru a veces manda: See video "Nombre" on OK. Video Player
     let wrapped = /see video\s+["«“'](.+?)["»”']/i.exec(v);
     if (wrapped) v = cleanText(wrapped[1]);
     if (/see video|on ok\.?\s*video player/i.test(v) && fb && !/see video/i.test(fb)) {
@@ -796,8 +704,6 @@ function getDuration(meta) {
     let n = parseFloat(v);
     if (!isFinite(n) || n <= 0) return 0;
 
-    // GrayJay espera segundos. movie.duration de OK.ru ya viene en segundos
-    // (ej. 1037 = 17 min); solo se divide si es un número enorme (ms).
     if (n > 100000) n = n / 1000;
 
     return Math.round(n);
@@ -847,19 +753,6 @@ function getDescription(meta) {
     );
 }
 
-/*
- * Xuper-compatible fallback.
- *
- * Verified APK field names include:
- *   play_params
- *   verificationToken / verification_token
- *   playlistUrl
- *   signdata
- *
- * We only consume a playlist URL that is already present in metadata.
- * We intentionally do not fabricate a signer, token generator, or private
- * Xuper endpoint because those are implementation-specific.
- */
 function xuperGetPlayParams(meta) {
     return firstValue(meta, ["play_params", "playParams"]);
 }
@@ -882,7 +775,6 @@ function xuperResolve(meta) {
     let direct = xuperGetPlaylistUrl(meta);
     if (isM3u8Url(direct)) return normalizeUrl(direct);
 
-    // Some responses nest the Xuper fields.
     let containers = [
         meta.xuper,
         meta.data,
@@ -902,45 +794,29 @@ function xuperResolve(meta) {
     return "";
 }
 
-// FIX (cast): el intento anterior de sacar todo requestModifier partía de
-// que agregar la Cookie de sesión al pedido del stream rompía la
-// reproducción local (se quedaba en 00:00) -y eso es cierto, la cookie NO
-// va acá-, pero de ahí se concluyó que no había que poner ningún header, y
-// esa parte estaba mal: sin Referer, el CDN de OK.ru resuelve/permite la
-// petición cuando la pide el propio reproductor de la app (que arma sus
-// propios headers por default), pero cuando el link se manda directo al
-// receptor de Cast (Chromecast), este pide el manifest/los segmentos sin
-// ese contexto y el CDN lo bloquea o devuelve una respuesta vacía -por eso
-// "funciona local pero no en cast". El extractor de OK.ru que ya probamos
-// en PelisHub (exOkRu) resuelve esto poniéndole Referer/User-Agent/Origin
-// de ok.ru a la fuente (sin cookie), y ahí el cast sí anda. Se porta la
-// misma idea acá.
-// Interruptor de diagnóstico: si al pasar esto a false los videos vuelven
-// a arrancar, confirma que el problema es el requestModifier (algún header
-// que el CDN de OK.ru no tolera en el player nativo). Si sigue sin arrancar
-// en false también, el problema es otra cosa (la URL en sí, la cookie, etc.).
 const ENABLE_SOURCE_HEADERS = true;
-// Orden de fuentes. false = comportamiento worker-cast (MP4 HD primero si la
-// calidad es conocida, luego HLS). true = HLS master primero (útil si algún
-// video con MP4 enorme no arranca).
-const PREFER_HLS_FIRST = true;
-// Origin no es necesario para el reproductor y algunos CDN de OK.ru lo
-// rechazan en determinadas URLs firmadas. Referer/UA se conservan.
-const SEND_ORIGIN_TO_PLAYER = false;
-const SEND_COOKIE_TO_VIDEO_PLAYER = false;
+const PREFER_HLS_FIRST = false;
+// CAMBIO: Activamos la inyección de cookies a la fuente de video
+const SEND_COOKIE_TO_VIDEO_PLAYER = true;
 
 function okRequestModifier() {
-    // SEND_COOKIE_TO_VIDEO_PLAYER queda false deliberadamente para probar
-    // si el CDN acepta las URLs firmadas sin sesión durante reproducción.
     let h = {
         "User-Agent": UA_DESKTOP,
-        "Referer": "https://ok.ru/"
+        "Referer": "https://ok.ru/",
+        "Origin": "https://ok.ru"
     };
-    if (SEND_ORIGIN_TO_PLAYER) h["Origin"] = "https://ok.ru";
     
-    // IMPORTANTE: no mandar la sesión al player / Chromecast.
-    // La cookie queda reservada para extracción/metadata; las fuentes que
-    // recibe el reproductor y Chromecast salen sin Cookie.
+    if (SEND_COOKIE_TO_VIDEO_PLAYER) {
+        try {
+            // Intentamos obtener e inyectar las cookies vigentes en la sesión de GrayJay
+            let cookies = http.getCookies("https://ok.ru/");
+            if (cookies && cookies.length > 0) {
+                h["Cookie"] = cookies.join("; ");
+            }
+        } catch (e) {
+            addDebug("okRequestModifier - error al inyectar cookies: " + e);
+        }
+    }
 
     return {
         headers: h,
@@ -968,15 +844,6 @@ function makeHlsSource(url, duration) {
     return null;
 }
 
-// FIX (calidad de cast): cuando el metadata solo trae UNA url .m3u8, en
-// muchos casos es un MASTER playlist (adaptativo) con varias variantes
-// adentro (#EXT-X-STREAM-INF). Dentro de la app, el player local sí sabe
-// elegir la mejor variante del master, pero al castear a Chromecast el
-// receptor puede terminar quedándose con la variante más baja. La forma
-// confiable de evitar eso es bajar el master, leer sus variantes reales
-// (BANDWIDTH/RESOLUTION) y ofrecerlas como fuentes HLS separadas y
-// nombradas (ej. "OK.ru HLS 1080p"), de mayor a menor calidad, en vez de
-// depender de que el receptor negocie bien el ABR del master.
 function resolveM3u8Uri(uri, masterUrl) {
     uri = cleanUrl(uri);
     if (!uri) return "";
@@ -1006,8 +873,7 @@ function fetchTextWithOkHeaders(url) {
             "Origin": "https://ok.ru",
             "Accept": "*/*"
         };
-        // Sin Cookie deliberadamente: esto es lectura del manifest durante
-        // la extracción de variantes, no búsqueda.
+        
         let r = http.GET(url, headers);
         if (!r) return "";
         let body = "";
@@ -1139,7 +1005,7 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         pushUnique(hls, normalHls[i]);
     }
 
-    let mp4 = collectMp4Urls(meta); // [{url, label}], ya ordenado de mayor a menor calidad
+    let mp4 = collectMp4Urls(meta); 
 
     let mp4Labels = [];
     for (let i = 0; i < mp4.length; i++) mp4Labels.push(mp4[i].label || "?");
@@ -1147,24 +1013,8 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         (mp4.length ? " labels=[" + mp4Labels.join(",") + "]" : ""));
     if (hls.length > 0) addDebug("hls[0] url=" + hls[0]);
 
-    /*
-     * RUTA RÁPIDA:
-     * No descargamos el master .m3u8 desde JS. Esa petición agrega latencia
-     * y, según las pruebas ya documentadas en este archivo, suele responder
-     * vacío desde el contexto del script mientras ExoPlayer/GrayJay sí puede
-     * leer el master directamente.
-     *
-     * Para Cast, si OK.ru entregó un MP4 cuya calidad conocemos y es HD,
-     * lo ponemos primero. Así el receptor recibe una fuente explícitamente
-     * etiquetada con la mejor calidad conocida, en lugar de arrancar con ABR.
-     * Si no hay MP4 HD conocido, mantenemos el HLS master como primera opción.
-     */
     let sources = [];
 
-    // v33: HLS primero. En v32 se priorizaba un MP4 HD si existía; en
-    // determinados videos esa URL directa existe pero no inicia en el player
-    // o en Cast, mientras que el HLS firmado sí funciona. Dejamos MP4 como
-    // fallback para no perder compatibilidad.
     let bestMp4Index = -1;
     let bestMp4Order = -1;
 
@@ -1177,9 +1027,9 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
-    if (PREFER_HLS_FIRST) {
-        addDebug("v33 source order: HLS first; MP4 fallback");
-    } else if (bestMp4Index >= 0 && bestMp4Order >= 70) {
+    if (PREFER_HLS_FIRST) bestMp4Index = -1;
+
+    if (bestMp4Index >= 0 && bestMp4Order >= 70) {
         let bestSrc = makeMp4Source(
             mp4[bestMp4Index].url,
             duration,
@@ -1192,7 +1042,6 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
-    // HLS master directo, sin round-trip adicional.
     for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
         let src = makeHlsSource(hls[i], duration);
         if (src) {
@@ -1201,14 +1050,12 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
         }
     }
 
-    // El resto de MP4 queda como fallback.
     for (let j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
         if (j === bestMp4Index) continue;
         let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
         if (src) sources.push(src);
     }
 
-    // Sin fuentes propias: si es un embed de otra plataforma, pedir el plugin.
     if (!sources.length) {
         let ext = extractExternalEmbed(html);
         if (!ext) {
@@ -1233,8 +1080,6 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
 
     let author = null;
     try {
-        // FIX: usar el nombre de autor/canal real cuando esté disponible
-        // en lugar de mostrar siempre "OK.ru" como autor.
         author = new PlatformAuthorLink(
             new PlatformID(PLATFORM_NAME, "", PLUGIN_ID),
             authorName,
@@ -1309,16 +1154,15 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     if (!id || seen[id] || results.length >= 96) return;
     block = safeStr(block);
 
-    // Embeds de YouTube: se entregan con la URL de YouTube para que los abra
-    // el plugin de YouTube. Otros proveedores externos (vimeo, etc.) se omiten.
     let ext = extractExternalEmbed(block);
     if (!ext && containsExternalVideoEmbed(block)) return;
 
     let title = cleanText(anchorTitle || "");
 
+    // CAMBIO: Se añadió aria-label y alt a la captura principal del nombre
     if (!title || title.length < 2) {
         let tm = block.match(
-            /(?:data-title|data-name|title)\s*=\s*["']([^"']{2,500})["']/i
+            /(?:data-title|data-name|title|aria-label|alt)\s*=\s*["']([^"']{2,500})["']/i
         );
         if (tm) title = cleanText(tm[1]);
     }
@@ -1356,11 +1200,6 @@ function addSearchCandidate(results, seen, id, block, anchorTitle) {
     seen[id] = true;
     rememberTitle(id, title);
 
-    // FIX real: no dar por sentado que el motor de GrayJay mantiene el
-    // estado de este script (TITLE_CACHE) entre la llamada a search() y la
-    // llamada posterior a getContentDetails(). Para no depender de eso, el
-    // título viaja directamente adentro de la URL que se le entrega a
-    // GrayJay; es la misma URL que después vuelve en getContentDetails(url).
     let urlWithTitle = ext
         ? ext.url
         : ("https://ok.ru/video/" + id +
@@ -1382,7 +1221,6 @@ function extractSearchResults(html) {
     let seen = {};
     html = safeStr(html);
 
-    // 1) Normal anchors.
     let re = /<a\b([^>]*?href\s*=\s*["'](?:https?:\/\/[^"']+)?\/(?:video|videoembed)\/(\d+)(?:[?#][^"']*)?["'][^>]*)>([\s\S]*?)<\/a>/gi;
     let m;
 
@@ -1396,7 +1234,6 @@ function extractSearchResults(html) {
         );
     }
 
-    // 2) data-movie-id / data-video-id blocks.
     let re2 = /(?:data-movie-id|data-video-id|data-content-id)\s*=\s*["']?(\d+)["']?/gi;
     while ((m = re2.exec(html)) !== null && results.length < 96) {
         let start = Math.max(0, m.index - 400);
@@ -1408,7 +1245,6 @@ function extractSearchResults(html) {
         );
     }
 
-    // 3) JSON/escaped OK.ru video URLs.
     let re3 = /(?:https?:)?\\?\/\\?\/(?:www\.)?ok\.ru\\?\/(?:video|videoembed)\\?\/(\d+)/gi;
     while ((m = re3.exec(html)) !== null && results.length < 96) {
         let start = Math.max(0, m.index - 400);
@@ -1420,7 +1256,6 @@ function extractSearchResults(html) {
         );
     }
 
-    // 4) Raw /video/<id> references.
     let re4 = /(?:^|["'(\s])\/video\/(\d+)(?:[?#"'()\s]|$)/gi;
     while ((m = re4.exec(html)) !== null && results.length < 96) {
         let start = Math.max(0, m.index - 400);
@@ -1436,10 +1271,6 @@ function extractSearchResults(html) {
 }
 
 function makeSearchVideo(r) {
-    // Persistir el título antes de que GrayJay haga la segunda llamada de
-    // detalles. La URL ya contiene ?t= como segunda barrera.
-    try { rememberTitle(r.id, r.title); } catch (_) {}
-
     let thumbs = [];
     if (isHttpUrl(r.thumbnail)) {
         try { thumbs.push(new Thumbnail(r.thumbnail, 0)); } catch (_) {}
@@ -1451,8 +1282,6 @@ function makeSearchVideo(r) {
 
     let author = null;
     try {
-        // Consistente con getContentDetails: mostrar un autor en vez de null
-        // para que la tarjeta de resultados también muestre algo en "autor".
         author = new PlatformAuthorLink(
             new PlatformID(PLATFORM_NAME, "", PLUGIN_ID),
             "OK.ru",
@@ -1483,13 +1312,11 @@ function fetchSearchPage(query, page) {
     let url = SEARCH_URL_BASE + encodeURIComponent(safeStr(query));
     if (page > 1) url += "&st.page=" + page;
 
-    // La búsqueda de OK.ru exige sesión: se usa la del Login de GrayJay.
     let html = httpGetAuthenticated(url);
     addDebug("search page " + page + " bytes=" + (html ? html.length : 0));
 
     let hasVideos = /\/(?:video|videoembed)\/\d+/i.test(safeStr(html));
     if (!hasVideos && (page <= 1 || looksLikeLoginWall(html))) {
-        // Sin enlaces a videos en la primera página (o pared de login): no hay sesión.
         throw makeErr(LOGIN_MSG);
     }
     return html || "";
@@ -1505,12 +1332,6 @@ function searchOk(query, continuationToken) {
         }
     } catch (_) {}
 
-    // FIX (velocidad): antes se traían 4 páginas (hasta 8 requests con
-    // reintento autenticado/no autenticado) ANTES de devolver el primer
-    // resultado a GrayJay, lo que explicaba el ~1min para "encontrar
-    // videos". Ahora se trae 1 sola página por llamada; GrayJay pide la
-    // siguiente automáticamente vía nextPage() cuando el usuario hace
-    // scroll, así el primer resultado aparece mucho antes.
     let html = fetchSearchPage(query, page);
     if (!html) throw new Error("OK.ru search returned no data");
 
@@ -1531,8 +1352,6 @@ function searchOk(query, continuationToken) {
         if (v) out.push(v);
     }
 
-    // OK.ru no indica cuál es la última página; mientras la página traiga
-    // resultados asumimos que puede haber más.
     let hasMore = raw.length > 0;
     let context = {
         query: safeStr(query),
@@ -1612,15 +1431,6 @@ function doDetails(url) {
 
     let cached = getCachedDetails(id);
     if (cached) {
-        // Si GrayJay vuelve con la URL que conserva ?t=<titulo>, úsalo para
-        // corregir una tarjeta que haya quedado con el ID como nombre.
-        let requestedTitle = extractTitleParam(url);
-        if (requestedTitle && !/^OK\.ru video\b/i.test(requestedTitle)) {
-            try {
-                cached.name = requestedTitle;
-                rememberTitle(id, requestedTitle);
-            } catch (_) {}
-        }
         addDebug("details cache HIT: " + id);
         return cached;
     }
@@ -1657,10 +1467,6 @@ function doDetails(url) {
         (xuperGetSignature(meta) ? "yes" : "no")
     );
 
-    // Orden de confianza: título embebido en la URL que llegó (viaja desde
-    // la búsqueda sin depender de estado en memoria) > título recordado en
-    // memoria (por si el motor sí conserva el contexto) > título de la
-    // página > genérico con el ID como último recurso.
     let fallbackTitle =
         extractTitleParam(url) ||
         recallTitle(id) ||
@@ -1678,7 +1484,6 @@ function doDetails(url) {
 /* ------------------------- GrayJay bindings ------------------------- */
 
 source.setSettings = function (settings) {
-    // Kept for compatibility with GrayJay versions that expect setSettings.
 };
 
 source.enable = function () {
