@@ -1,211 +1,96 @@
 /*
- * GrayJay - OK.ru Source v4 (rapido, estilo YouTube)
+ * GrayJay - OK.ru Source v39 (Cast + canal clicable)
  *
- * Por que YouTube encuentra y reproduce antes:
- *   - search y player son POST JSON (youtubei/v1), no un HTML de megabytes.
- *   - getContentDetails arma player + ficha en paralelo con http.batch().
- *   - el script entrega URLs firmadas y no vuelve a bajar el manifest.
- *   - no mete Cookie/Origin en el stream (el CDN ya firmo la URL).
+ * Por qué PlayPelis “sí” y aquí a veces “no” (mismos links ok.ru):
+ *   PlayPelis pide HTML + master HLS + segmentos en el MISMO proceso HTTP.
+ *   GrayJay solo entrega URLs al player/Cast; el script NO puede tocar
+ *   okcdn.ru (whitelist). El CDN ya firma la URL; no hace falta cookie
+ *   ni Origin en el stream. Meter requestModifier en HLSSource fue lo que
+ *   dejaba 00:00 o rompía Chromecast (lección de v12_CAST).
  *
- * Que cambia aqui respecto a v38:
- *   1. Reproducir: POST chico a /dk?cmd=videoPlayerMetadata&mid=ID.
- *      Si trae videos[] o hlsManifestUrl, no se descarga la pagina.
- *   2. Si la API falla, http.batch() pide embed publico y embed con
- *      sesion a la vez (el tiempo es el del mas lento, no la suma).
- *   3. Buscar: una sola pagina autenticada y un solo recorrido del HTML.
- *      Antes habia 4 regex sobre todo el documento.
- *   4. Fuentes sin requestModifier (Cast y player). MP4 HD primero si
- *      la calidad es conocida: arranca como un itag directo de YouTube.
- *      HLS master queda de respaldo.
- *   5. Sugerencias ya no disparan una busqueda completa.
+ * v38:
+ *   - Fuentes HLS/MP4 SIN headers/requestModifier (igual que CAST que castea).
+ *   - HLS master primero (mejor para Cast); MP4 como fallback.
+ *   - Sesión GrayJay solo para buscar; extracción pública + fallback sesión
+ *     solo para metadata (cookie nunca al player/Cast).
+ *   - Títulos: filtra "View"/"Ver"/"Watch"/etc.; ?t= en la URL.
+ *   - Sin HLS_PROBE (falla siempre por whitelist de okcdn.ru).
+ *
+ * Important: no se inventa firma Xuper; se usa playlistUrl/HLS/MP4 del metadata.
  */
 
 const PLATFORM_NAME = "OK.ru";
 const PLUGIN_ID = "62af0e2f-bfd9-489f-afe1-f66583d2f7d0";
 
+function nowMs() {
+    try { return Date.now(); } catch (_) { return 0; }
+}
+
+// FIX: esta constante faltaba y provocaba el ReferenceError al construir
+// las cabeceras de las fuentes de video ("UA_DESKTOP is not defined").
 const UA_DESKTOP =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
     "Chrome/136.0.0.0 Safari/537.36";
 
 const REGEX_VIDEO_URL = /ok\.ru\/(?:video|videoembed)\/(\d+)/i;
+// Canal clicable: perfil, grupo o álbum de videos. No debe coincidir con /video/<id>.
+const REGEX_CHANNEL_URL = /ok\.ru\/(?:profile\/\d+|group\/\d+|video\/c\d+)(?:\/|$|\?)/i;
 const SEARCH_URL_BASE =
-    "https://m.ok.ru/dk?st.cmd=searchResult&st.mode=Movie&st.grmode=Groups&st.query=";
+    "https://ok.ru/dk?st.cmd=searchResult&st.mode=Movie&st.grmode=Groups&st.query=";
 
-const MAX_HTML_SIZE = 900000;
-const MAX_SOURCES = 8;
-const MAX_SEARCH = 24;
+const MAX_HTML_SIZE = 5000000;
+const MAX_JSON_DEPTH = 12;
+const MAX_SOURCES = 12;
+const MAX_DEBUG = 50;
 const MAX_TITLE_CACHE = 300;
-const DETAILS_CACHE_TTL = 180000;
-
-const LOGIN_MSG = "Inicie sesion para encontrar videos";
 
 let DEBUG = [];
+
+// FIX: la búsqueda ya conoce el título real (ej. "Historia de Evan") pero
+// getContentDetails/getVideoDetails es una llamada aparte que no lo recibe;
+// si el metadata o el <title> de la página no traen nada útil, terminaba
+// mostrando "OK.ru video <id>". Guardamos acá lo que ya vimos en la búsqueda
+// para poder recuperarlo como fallback antes de caer al ID.
 let TITLE_CACHE = {};
 let TITLE_CACHE_ORDER = [];
+
+// GrayJay puede pedir getContentDetails() y getVideoDetails() seguidos.
+// Cache corto para no volver a descargar y parsear la misma página.
+const DETAILS_CACHE_TTL = 120000;
 let DETAILS_CACHE = {};
 
-function nowMs() {
-    try { return Date.now(); } catch (_) { return 0; }
+function getCachedDetails(id) {
+    try {
+        let x = DETAILS_CACHE[id];
+        if (!x) return null;
+        if (nowMs() - x.time > DETAILS_CACHE_TTL) {
+            delete DETAILS_CACHE[id];
+            return null;
+        }
+        return x.value || null;
+    } catch (_) {
+        return null;
+    }
 }
 
-function addDebug(value) {
+function putCachedDetails(id, value) {
     try {
-        let s = safeStr(value);
-        if (!s) return;
-        if (DEBUG.length >= 24) DEBUG.shift();
-        DEBUG.push(s.length > 240 ? s.substring(0, 240) + "..." : s);
+        if (id && value) DETAILS_CACHE[id] = { time: nowMs(), value: value };
     } catch (_) {}
-}
-
-function resetDebug() { DEBUG = []; }
-function debugText() { return DEBUG.join("\n"); }
-
-function safeStr(v) {
-    try {
-        if (v === null || v === undefined) return "";
-        if (typeof v === "string") return v;
-        return String(v);
-    } catch (_) { return ""; }
-}
-
-function safeObj(v) {
-    return v !== null && typeof v === "object";
-}
-
-function htmlDecode(s) {
-    s = safeStr(s);
-    return s
-        .replace(/"/gi, '"')
-        .replace(/&#34;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/'/gi, "'")
-        .replace(/&/gi, "&")
-        .replace(/</gi, "<")
-        .replace(/>/gi, ">")
-        .replace(/&#x2F;/gi, "/")
-        .replace(/&#47;/g, "/");
-}
-
-function stripTags(s) {
-    return safeStr(s).replace(/<[^>]*>/g, " ");
-}
-
-function cleanText(s) {
-    return htmlDecode(stripTags(s)).replace(/\s+/g, " ").trim();
-}
-
-function cleanUrl(s) {
-    return htmlDecode(safeStr(s))
-        .replace(/^["']+|["']+$/g, "")
-        .replace(/\\\//g, "/")
-        .replace(/\\u0026/gi, "&")
-        .trim();
-}
-
-function normalizeUrl(s, base) {
-    s = cleanUrl(s);
-    if (!s) return "";
-    if (s.indexOf("//") === 0) return "https:" + s;
-    if (/^https?:\/\//i.test(s)) return s;
-    if (base && s.indexOf("/") === 0) {
-        let m = safeStr(base).match(/^(https?:\/\/[^/]+)/i);
-        if (m) return m[1] + s;
-    }
-    return s;
-}
-
-function isHttpUrl(s) {
-    return /^https?:\/\//i.test(cleanUrl(s));
-}
-
-function isM3u8Url(url) {
-    return /\.m3u8(?:$|[?#])/i.test(cleanUrl(url));
-}
-
-function extractVideoId(url) {
-    try {
-        let m = safeStr(url).match(REGEX_VIDEO_URL);
-        return m ? m[1] : "";
-    } catch (_) { return ""; }
-}
-
-function makeErr(msg) {
-    try { return new ScriptException(msg); } catch (_) { return new Error(msg); }
-}
-
-function readBody(r) {
-    let body = "";
-    if (!r) return body;
-    try { body = r.body; } catch (_) {}
-    if (!body) { try { body = r.getBody(); } catch (_) {} }
-    body = safeStr(body);
-    if (body.length > MAX_HTML_SIZE) body = body.substring(0, MAX_HTML_SIZE);
-    return body;
-}
-
-function pageHeaders() {
-    return {
-        "User-Agent": UA_DESKTOP,
-        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://ok.ru/",
-        "Origin": "https://ok.ru"
-    };
-}
-
-function httpGet(url, headers, auth) {
-    try {
-        let r = auth ? http.GET(url, headers || pageHeaders(), true) : http.GET(url, headers || pageHeaders());
-        return readBody(r);
-    } catch (e) {
-        addDebug("httpGet: " + e);
-        return "";
-    }
-}
-
-function httpPost(url, body, headers, auth) {
-    try {
-        let h = pageHeaders();
-        h["Content-Type"] = "application/x-www-form-urlencoded";
-        h["Accept"] = "application/json, text/plain, */*";
-        if (headers) {
-            for (let k in headers) h[k] = headers[k];
-        }
-        let r = auth ? http.POST(url, body || "", h, true) : http.POST(url, body || "", h);
-        return readBody(r);
-    } catch (e) {
-        addDebug("httpPost: " + e);
-        return "";
-    }
-}
-
-function tryParseJson(value) {
-    if (value === null || value === undefined) return null;
-    if (safeObj(value)) return value;
-    let s = safeStr(value).trim();
-    if (!s || (s.charAt(0) !== "{" && s.charAt(0) !== "[" && s.charAt(0) !== '"')) return null;
-    for (let pass = 0; pass < 3; pass++) {
-        try { return JSON.parse(s); } catch (_) {}
-        let decoded = htmlDecode(s);
-        if (decoded !== s) { s = decoded; continue; }
-        if ((s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') ||
-            (s.charAt(0) === "'" && s.charAt(s.length - 1) === "'")) {
-            s = s.substring(1, s.length - 1);
-            continue;
-        }
-        break;
-    }
-    return null;
 }
 
 function rememberTitle(id, title) {
     id = safeStr(id);
     title = cleanText(title);
-    if (!id || !title || /^OK\.ru video\b/i.test(title) || /^\d+$/.test(title)) return;
+    if (!id || !title) return;
+    if (/^OK\.ru video\b/i.test(title)) return; // no guardar títulos genéricos
+
     if (!(id in TITLE_CACHE) && TITLE_CACHE_ORDER.length >= MAX_TITLE_CACHE) {
-        delete TITLE_CACHE[TITLE_CACHE_ORDER.shift()];
+        let oldest = TITLE_CACHE_ORDER.shift();
+        delete TITLE_CACHE[oldest];
     }
+
     if (!(id in TITLE_CACHE)) TITLE_CACHE_ORDER.push(id);
     TITLE_CACHE[id] = title;
 }
@@ -223,161 +108,536 @@ function extractTitleParam(url) {
     return "";
 }
 
-function getCachedDetails(id) {
+function addDebug(value) {
     try {
-        let x = DETAILS_CACHE[id];
-        if (!x) return null;
-        if (nowMs() - x.time > DETAILS_CACHE_TTL) {
-            delete DETAILS_CACHE[id];
-            return null;
-        }
-        return x.value || null;
-    } catch (_) { return null; }
-}
-
-function putCachedDetails(id, value) {
-    try {
-        if (id && value) DETAILS_CACHE[id] = { time: nowMs(), value: value };
+        let s = safeStr(value);
+        if (!s) return;
+        if (DEBUG.length >= MAX_DEBUG) DEBUG.shift();
+        DEBUG.push(s.length > 600 ? s.substring(0, 600) + "…" : s);
     } catch (_) {}
 }
 
-function looksLikeLoginWall(html) {
-    return /st\.cmd=anonym|anonymLogin|anonymMain|st\.email|st\.password|field_email|join ok|log in to ok|войти/i
-        .test(safeStr(html));
+function resetDebug() {
+    DEBUG = [];
 }
 
-/* ---------- metadata: API JSON primero (el equivalente al player de YT) ---------- */
-
-function metaPlayable(meta) {
-    if (!safeObj(meta) || meta.error) return false;
-    if (isM3u8Url(meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls || meta.playlistUrl || "")) return true;
-    return Array.isArray(meta.videos) && meta.videos.length > 0 && meta.videos[0] && meta.videos[0].url;
+function debugText() {
+    return DEBUG.join("\n");
 }
 
-function fetchMetadataApi(id, auth) {
-    let url = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=" + id;
-    let body = httpPost(url, "mid=" + encodeURIComponent(id), {
-        "Referer": "https://ok.ru/videoembed/" + id
-    }, auth);
-    let meta = tryParseJson(body);
-    if (metaPlayable(meta)) {
-        addDebug("metadata API " + (auth ? "auth" : "public") + " OK");
-        return meta;
+function safeStr(v) {
+    try {
+        if (v === null || v === undefined) return "";
+        if (typeof v === "string") return v;
+        return String(v);
+    } catch (_) {
+        return "";
     }
-    body = httpGet(url, pageHeaders(), auth);
-    meta = tryParseJson(body);
-    if (metaPlayable(meta)) {
-        addDebug("metadata API GET " + (auth ? "auth" : "public") + " OK");
-        return meta;
+}
+
+function safeObj(v) {
+    return v !== null && typeof v === "object";
+}
+
+function htmlDecode(s) {
+    s = safeStr(s);
+    return s
+        .replace(/&quot;/gi, '"')
+        .replace(/&#34;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&apos;/gi, "'")
+        .replace(/&amp;/gi, "&")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&#x2F;/gi, "/")
+        .replace(/&#47;/g, "/");
+}
+
+function stripTags(s) {
+    return safeStr(s).replace(/<[^>]*>/g, " ");
+}
+
+function cleanText(s) {
+    return htmlDecode(stripTags(s))
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function cleanUrl(s) {
+    return htmlDecode(safeStr(s))
+        .replace(/^["']+|["']+$/g, "")
+        .replace(/\\\//g, "/")
+        .trim();
+}
+
+function normalizeUrl(s, base) {
+    s = cleanUrl(s);
+    if (!s) return "";
+
+    if (s.indexOf("//") === 0) return "https:" + s;
+
+    if (/^https?:\/\//i.test(s)) return s;
+
+    if (base) {
+        try {
+            if (s.indexOf("/") === 0) {
+                let m = safeStr(base).match(/^(https?:\/\/[^/]+)/i);
+                if (m) return m[1] + s;
+            }
+        } catch (_) {}
     }
+
+    return s;
+}
+
+function isHttpUrl(s) {
+    return /^https?:\/\//i.test(cleanUrl(s));
+}
+
+function getHost(url) {
+    try {
+        let m = safeStr(url).match(/^https?:\/\/([^/]+)/i);
+        return m ? m[1].toLowerCase() : "";
+    } catch (_) {
+        return "";
+    }
+}
+
+function isExternalProvider(url) {
+    let h = getHost(url);
+    if (!h) return false;
+    return /youtube\.com|youtu\.be|vimeo\.com/i.test(h);
+}
+
+
+
+function containsExternalVideoEmbed(value) {
+    let x = safeStr(value)
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/gi, "&");
+
+    return /(?:youtube(?:-nocookie)?\.com|youtu\.be|vimeo\.com)/i.test(x) &&
+           /(?:iframe|embed|externalVideo|externalVideoId|youtubeId|youtubeVideoId|playerResponse|watch\?v=|youtube(?:-nocookie)?\.com\/(?:embed|watch|shorts|live|v)|youtu\.be\/)/i.test(x);
+}
+
+function extractYouTubeId(value) {
+    let x = safeStr(value)
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/gi, "&");
+    // Patrones estrictos: evita falsos positivos del player de OK ("paths":{"youtube"...}).
+    let patterns = [
+        /(?:youtube(?:-nocookie)?\.com\/(?:embed|shorts|live|v)\/)([A-Za-z0-9_-]{11})/i,
+        /(?:youtube(?:-nocookie)?\.com\/watch\?(?:[^"'<>]*&)?v=)([A-Za-z0-9_-]{11})/i,
+        /youtu\.be\/([A-Za-z0-9_-]{11})/i,
+        /(?:externalVideoId|youtubeId|youtubeVideoId)\s*[:=]\s*["']([A-Za-z0-9_-]{11})["']/i
+    ];
+    for (let i = 0; i < patterns.length; i++) {
+        let m = x.match(patterns[i]);
+        if (m) return m[1];
+    }
+    return "";
+}
+
+// Plataformas externas embebidas en OK.ru -> plugin al que se deriva.
+function extractExternalEmbed(value) {
+    let x = safeStr(value)
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/gi, "&");
+
+    let yt = extractYouTubeId(x);
+    if (yt) return { plugin: "YouTube", id: yt, url: youtubeWatchUrl(yt) };
+
+    let m = x.match(/player\.vimeo\.com\/video\/(\d{5,12})|vimeo\.com\/(?:video\/)?(\d{5,12})/i);
+    if (m) {
+        let id = m[1] || m[2];
+        return { plugin: "Vimeo", id: id, url: "https://vimeo.com/" + id };
+    }
+
+    m = x.match(/dailymotion\.com\/(?:embed\/)?video\/([A-Za-z0-9]{5,10})|dai\.ly\/([A-Za-z0-9]{5,10})/i);
+    if (m) {
+        let id = m[1] || m[2];
+        return { plugin: "Dailymotion", id: id, url: "https://www.dailymotion.com/video/" + id };
+    }
+
+    m = x.match(/rutube\.ru\/(?:play\/embed|video)\/([a-f0-9]{32})/i);
+    if (m) {
+        return { plugin: "Rutube", id: m[1], url: "https://rutube.ru/video/" + m[1] + "/" };
+    }
+
     return null;
 }
 
+function installPluginMessage(ext) {
+    return "Este video está alojado en " + ext.plugin + ".\nGrayJay no permite salto automático desde esta pantalla. Copie el enlace o búsquelo en la plataforma original:\n" + ext.url;
+}
+
+function youtubeWatchUrl(id) {
+    id = safeStr(id);
+    return id ? ("https://www.youtube.com/watch?v=" + id) : "";
+}
+
+function isM3u8Url(url) {
+    return /\.m3u8(?:$|[?#])/i.test(cleanUrl(url));
+}
+
+function extractVideoId(url) {
+    try {
+        let m = safeStr(url).match(REGEX_VIDEO_URL);
+        return m ? m[1] : "";
+    } catch (_) {
+        return "";
+    }
+}
+
+function mergeHeaders(target, extra) {
+    target = target || {};
+    if (!extra) return target;
+
+    try {
+        for (let k in extra) {
+            if (extra[k] !== null && extra[k] !== undefined) {
+                target[k] = safeStr(extra[k]);
+            }
+        }
+    } catch (_) {}
+
+    return target;
+}
+
+function httpGet(url, headers) {
+    try {
+        let h = {
+            "User-Agent": UA_DESKTOP,
+            "Accept":
+                "text/html,application/xhtml+xml,application/xml;q=0.9," +
+                "image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        };
+
+        mergeHeaders(h, headers);
+
+        let r = http.GET(url, h);
+        if (!r) return "";
+
+        let body = "";
+        try {
+            body = r.body;
+        } catch (_) {}
+
+        if (!body) {
+            try {
+                body = r.getBody();
+            } catch (_) {}
+        }
+
+        body = safeStr(body);
+
+        if (body.length > MAX_HTML_SIZE) {
+            addDebug("HTTP body capped: " + body.length);
+            body = body.substring(0, MAX_HTML_SIZE);
+        }
+
+        return body;
+    } catch (e) {
+        addDebug("httpGet: " + e);
+        return "";
+    }
+}
+
+function httpPost(url, body, headers) {
+    try {
+        let h = {
+            "User-Agent": UA_DESKTOP,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "*/*"
+        };
+        mergeHeaders(h, headers);
+
+        let r = http.POST(url, body || "", h);
+        if (!r) return "";
+
+        let respBody = "";
+        try { respBody = r.body; } catch (_) {}
+        if (!respBody) { try { respBody = r.getBody(); } catch (_) {} }
+
+        respBody = safeStr(respBody);
+        if (respBody.length > MAX_HTML_SIZE) respBody = respBody.substring(0, MAX_HTML_SIZE);
+        return respBody;
+    } catch (e) {
+        addDebug("httpPost: " + e);
+        return "";
+    }
+}
+
+function looksLikeSearchResults(html) {
+    return /\/(?:video|videoembed)\/\d+/i.test(safeStr(html));
+}
+
+function readBody(r) {
+    let body = "";
+    if (!r) return body;
+    try { body = r.body; } catch (_) {}
+    if (!body) { try { body = r.getBody(); } catch (_) {} }
+    body = safeStr(body);
+    if (body.length > MAX_HTML_SIZE) body = body.substring(0, MAX_HTML_SIZE);
+    return body;
+}
+
+function makeErr(msg) {
+    try { return new ScriptException(msg); } catch (_) { return new Error(msg); }
+}
+
+var LOGIN_MSG = "Inicie sesión para encontrar videos";
+
+function looksLikeLoginWall(html) {
+    return /st\.cmd=anonym|anonymLogin|anonymMain|st\.email|st\.password|field_email|unite a ok|únete a ok|join ok|log in to ok|войти в одноклассники/i
+        .test(safeStr(html));
+}
+
+// Solo sesión del Login nativo de GrayJay. Lanza LOGIN_MSG si no hay sesión.
+function httpGetAuthenticated(url) {
+    let headers = {
+        "User-Agent": UA_DESKTOP,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
+        "Referer": "https://ok.ru/"
+    };
+    let r;
+    try {
+        r = http.GET(url, headers, true);
+    } catch (e) {
+        addDebug("search: sesión GrayJay no disponible: " + e);
+        throw makeErr(LOGIN_MSG);
+    }
+    return readBody(r);
+}
+
+function loadOkPage(url, id) {
+    // v33: la extracción intenta primero la página pública, pero si ésta
+    // entrega una página incompleta/bloqueada o metadata sin una fuente
+    // reproducible, se repite con la sesión nativa de GrayJay.
+    // IMPORTANTE: esta cookie SOLO se usa aquí para EXTRAER metadata.
+    // Nunca se copia a las fuentes de reproducción.
+    let t0 = nowMs();
+    let headers = {
+        "User-Agent": UA_DESKTOP,
+        "Referer": "https://ok.ru/",
+        "Origin": "https://ok.ru"
+    };
+
+    let publicBody = "";
+    if (id) publicBody = httpGet("https://ok.ru/videoembed/" + id, headers);
+    if (!publicBody) publicBody = httpGet(url, headers);
+
+    if (publicBody) {
+        try {
+            let publicMeta = parseMetadata(publicBody, url);
+            if (publicMeta && (collectHlsUrls(publicMeta).length > 0 ||
+                collectMp4Urls(publicMeta).length > 0 ||
+                isM3u8Url(xuperResolve(publicMeta)))) {
+                addDebug("OK page public usable (no cookie): " + (nowMs() - t0) + "ms");
+                LAST_PAGE_MODE = "pública (sin sesión)";
+                return publicBody;
+            }
+            addDebug("OK public metadata sin fuente reproducible; pruebo sesión");
+        } catch (e) {
+            addDebug("OK public metadata parse fallback: " + e);
+        }
+    }
+
+    // Fallback autenticado: primero el embed (igual que exOkRu), luego la
+    // página completa. Se devuelve la primera que traiga fuentes reproducibles.
+    function playable(body) {
+        try {
+            let mt = parseMetadata(body, url);
+            if (!mt) return false;
+            if (mt.error) addDebug("OK meta.error: " + mt.error);
+            return collectHlsUrls(mt).length > 0 ||
+                collectMp4Urls(mt).length > 0 ||
+                isM3u8Url(xuperResolve(mt));
+        } catch (_) { return false; }
+    }
+    let authFirst = "";
+    let targets = [];
+    if (id) targets.push("https://ok.ru/videoembed/" + id);
+    targets.push(url);
+    for (let ti = 0; ti < targets.length; ti++) {
+        try {
+            let authBody = httpGetAuthenticated(targets[ti]);
+            if (!authBody) continue;
+            if (!authFirst) authFirst = authBody;
+            if (playable(authBody)) {
+                addDebug("OK auth playable via " + targets[ti] + ": " + (nowMs() - t0) + "ms");
+                LAST_PAGE_MODE = "CON sesión (" + targets[ti] + ")";
+                return authBody;
+            }
+            addDebug("OK auth sin fuentes en " + targets[ti]);
+        } catch (e2) {
+            addDebug("OK authenticated extraction failed: " + e2);
+            break;
+        }
+    }
+    if (authFirst) { LAST_PAGE_MODE = "con sesión, sin fuentes"; return authFirst; }
+
+    LAST_PAGE_MODE = "pública, sin fuentes";
+    addDebug("OK page public fallback: " + (nowMs() - t0) + "ms");
+    return publicBody || "";
+}
+function tryParseJson(value) {
+    if (value === null || value === undefined) return null;
+
+    if (safeObj(value)) return value;
+
+    let s = safeStr(value).trim();
+    if (!s) return null;
+
+    for (let pass = 0; pass < 4; pass++) {
+        try {
+            let v = JSON.parse(s);
+            return v;
+        } catch (_) {}
+
+        let decoded = htmlDecode(s);
+        if (decoded !== s) {
+            s = decoded;
+            continue;
+        }
+
+        if (
+            (s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') ||
+            (s.charAt(0) === "'" && s.charAt(s.length - 1) === "'")
+        ) {
+            s = s.substring(1, s.length - 1);
+            continue;
+        }
+
+        let unescaped = s
+            .replace(/\\"/g, '"')
+            .replace(/\\'/g, "'")
+            .replace(/\\\\/g, "\\");
+
+        if (unescaped !== s) {
+            s = unescaped;
+            continue;
+        }
+
+        break;
+    }
+
+    return null;
+}
+
+/*
+ * PRUEBA (v30): extractor de metadata reemplazado por la lógica simple y
+ * directa de exOkRu (PelisHub/PlayPelis_simple), en vez del recorrido
+ * genérico de árbol que tenía v29 (findMetadataInObject + escaneo de
+ * candidatos JSON). Misma idea que el simple: leer el primer
+ * data-options de la página, sacar flashvars.metadata (parseando si es
+ * string, o pidiendo metadataUrl si no vino inline), y devolver eso tal
+ * cual. Si no hay data-options/metadata, plan B: buscar "hlsManifestUrl"
+ * directo en el texto de la página.
+ */
 function extractMetadataFromHtml(html) {
     html = safeStr(html);
     if (!html) return null;
 
-    let i = html.indexOf("hlsManifestUrl");
-    if (i >= 0) {
-        let slice = htmlDecode(html.substring(i, i + 700)).replace(/\\\//g, "/");
-        let mm = /hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(slice);
-        if (mm && isM3u8Url(mm[1])) {
-            addDebug("html plan B hlsManifestUrl");
-            return { hlsManifestUrl: cleanUrl(mm[1]) };
+    let m = null;
+    {
+        let reAll = /data-options\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+        let cand, firstAny = null;
+        while ((cand = reAll.exec(html)) !== null) {
+            if (!firstAny) firstAny = cand;
+            let rawc = cand[1] !== undefined ? cand[1] : cand[2];
+            if (rawc && rawc.indexOf("flashvars") >= 0) { m = cand; break; }
         }
+        if (!m) m = firstAny;
+    }
+    if (m) {
+        let raw = m[1] !== undefined ? m[1] : m[2];
+        let o = tryParseJson(raw);
+        let fv = o && o.flashvars;
+        if (fv) {
+            let meta = fv.metadata;
+            if (typeof meta === "string") meta = tryParseJson(meta);
+            if (meta) return meta;
+
+            let metaUrl = fv.metadataUrl || fv.metadataURL;
+            if (metaUrl) {
+                addDebug("metadataUrl: " + metaUrl);
+                let fullUrl = normalizeUrl(metaUrl, "https://ok.ru/");
+                let headers = {
+                    "User-Agent": UA_DESKTOP,
+                    "Referer": "https://ok.ru/",
+                    "Origin": "https://ok.ru"
+                };
+
+                // OPTIMIZACIÓN: POST primero
+                let body = httpPost(fullUrl, "", headers);
+                meta = tryParseJson(body);
+                if (meta) return meta;
+
+                // Fallback a GET
+                body = httpGet(fullUrl, headers);
+                meta = tryParseJson(body);
+                if (meta) return meta;
+            }
+        }
+        addDebug("data-options presente pero sin metadata utilizable");
+    } else {
+        addDebug("sin data-options en la página");
     }
 
-    let marker = html.indexOf("flashvars");
-    if (marker < 0) marker = html.indexOf("data-options");
-    if (marker < 0) return null;
-
-    let start = html.lastIndexOf("data-options", marker);
-    if (start < 0) start = Math.max(0, marker - 200);
-    let chunk = html.substring(start, Math.min(html.length, start + 120000));
-    let m = /data-options\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(chunk);
-    if (!m) return null;
-    let raw = m[1] !== undefined ? m[1] : m[2];
-    let o = tryParseJson(raw);
-    let fv = o && o.flashvars;
-    if (!fv) return null;
-
-    let meta = fv.metadata;
-    if (typeof meta === "string") meta = tryParseJson(meta);
-    if (metaPlayable(meta) || safeObj(meta)) return meta;
-
-    let metaUrl = fv.metadataUrl || fv.metadataURL;
-    if (metaUrl) {
-        let fullUrl = normalizeUrl(metaUrl, "https://ok.ru/");
-        addDebug("metadataUrl fallback");
-        let body = httpPost(fullUrl, "", pageHeaders(), false);
-        meta = tryParseJson(body);
-        if (meta) return meta;
-        body = httpGet(fullUrl, pageHeaders(), false);
-        meta = tryParseJson(body);
-        if (meta) return meta;
+    // Plan B: buscar la clave directo en el texto
+    let t = htmlDecode(html).replace(/\\\//g, "/");
+    let mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(t);
+    if (mm) {
+        addDebug("plan B: hlsManifestUrl encontrado directo en el HTML");
+        return { hlsManifestUrl: cleanUrl(mm[1]) };
     }
+
     return null;
 }
 
-function batchGet(urls, authFlags) {
-    try {
-        if (!http.batch) return null;
-        let batch = http.batch();
-        for (let i = 0; i < urls.length; i++) {
-            batch = batch.GET(urls[i], pageHeaders(), !!authFlags[i]);
-        }
-        let res = batch.execute();
-        if (!res || !res.length) return null;
-        let out = [];
-        for (let j = 0; j < res.length; j++) out.push(readBody(res[j]));
-        return out;
-    } catch (e) {
-        addDebug("batch: " + e);
-        return null;
-    }
-}
-
-function loadMetadata(id, pageUrl) {
+function parseMetadata(html, pageUrl) {
     let t0 = nowMs();
-    let meta = fetchMetadataApi(id, false);
-    if (metaPlayable(meta)) {
-        addDebug("fast path API " + (nowMs() - t0) + "ms");
-        return { meta: meta, html: "" };
-    }
-
-    meta = fetchMetadataApi(id, true);
-    if (metaPlayable(meta)) {
-        addDebug("fast path API auth " + (nowMs() - t0) + "ms");
-        return { meta: meta, html: "" };
-    }
-
-    let embed = "https://ok.ru/videoembed/" + id;
-    let page = pageUrl || ("https://ok.ru/video/" + id);
-    let bodies = batchGet([embed, page], [false, true]);
-    if (!bodies) {
-        bodies = [
-            httpGet(embed, pageHeaders(), false),
-            httpGet(embed, pageHeaders(), true)
-        ];
-    }
-
-    let html = "";
-    for (let i = 0; i < bodies.length; i++) {
-        if (!bodies[i]) continue;
-        if (!html) html = bodies[i];
-        let parsed = extractMetadataFromHtml(bodies[i]);
-        if (metaPlayable(parsed)) {
-            addDebug("html fallback playable " + (nowMs() - t0) + "ms");
-            return { meta: parsed, html: bodies[i] };
-        }
-        if (parsed && !meta) meta = parsed;
-    }
-    addDebug("metadata slow path " + (nowMs() - t0) + "ms");
-    return { meta: meta, html: html };
+    let meta = extractMetadataFromHtml(html);
+    addDebug("extractMetadataFromHtml: " + (nowMs() - t0) + "ms");
+    return meta;
 }
 
-/* ---------- fuentes ---------- */
+function pushUnique(arr, value) {
+    value = normalizeUrl(value);
+    if (!isHttpUrl(value)) return;
+    if (arr.indexOf(value) >= 0) return;
+    if (arr.length >= MAX_SOURCES) return;
+    arr.push(value);
+}
 
+/*
+ * PRUEBA (v30): igual que exOkRu del simple - el HLS es directo,
+ * meta.hlsManifestUrl (o los alias que tambien usa OK.ru), sin recorrido
+ * de arbol ni regex sobre todo el JSON.
+ */
+function collectHlsUrls(meta) {
+    if (!safeObj(meta)) return [];
+    let hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls || "";
+    let url = normalizeUrl(hls, "https://ok.ru/");
+    return isM3u8Url(url) ? [url] : [];
+}
+
+// FIX (calidad de cast): OK.ru suele exponer varias URLs de video con una
+// etiqueta de calidad (name/type) como "low", "sd", "hd", "full", etc. El
+// código anterior descartaba esa etiqueta y guardaba todas las fuentes con
+// width/height/bitrate en 0, así que GrayJay no tenía ninguna señal para
+// elegir la mejor y terminaba mandando a Cast la primera que encontraba
+// (con frecuencia la de menor calidad). Ahora se mapean las etiquetas
+// conocidas a una resolución/bitrate aproximados y se ordenan las fuentes
+// de mayor a menor calidad.
 const QUALITY_RANK = {
     "ultra": { height: 2160, order: 100 },
     "highest": { height: 1440, order: 95 },
@@ -391,6 +651,7 @@ const QUALITY_RANK = {
     "sdp": { height: 480, order: 50 },
     "low": { height: 360, order: 30 },
     "lq": { height: 360, order: 30 },
+    "lqp": { height: 360, order: 30 },
     "lowest": { height: 240, order: 10 },
     "mobile": { height: 144, order: 5 }
 };
@@ -410,68 +671,119 @@ function estimateBitrate(height) {
     return 400000;
 }
 
-function collectHlsUrls(meta) {
-    if (!safeObj(meta)) return [];
-    let hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls || meta.playlistUrl || "";
-    let url = normalizeUrl(hls, "https://ok.ru/");
-    return isM3u8Url(url) ? [url] : [];
+function pushUniqueQuality(arr, url, label) {
+    url = normalizeUrl(url);
+    if (!isHttpUrl(url)) return;
+    for (let i = 0; i < arr.length; i++) {
+        if (arr[i].url === url) return;
+    }
+    if (arr.length >= MAX_SOURCES) return;
+    arr.push({ url: url, label: safeStr(label) });
 }
 
+function sortByQuality(items) {
+    let ranked = items.map(function (item, idx) {
+        let q = qualityInfo(item.label);
+        return { item: item, order: q ? q.order : -1, idx: idx };
+    });
+    ranked.sort(function (a, b) {
+        if (b.order !== a.order) return b.order - a.order;
+        return a.idx - b.idx; // estable para calidades iguales/desconocidas
+    });
+    return ranked.map(function (r) { return r.item; });
+}
+
+/*
+ * PRUEBA (v30): igual que exOkRu del simple - meta.videos es directamente
+ * el array [{name, url}] que manda OK.ru, sin recorrido genérico del resto
+ * del JSON. El label queda como el "name" crudo (hd, sd, full...) para que
+ * qualityInfo()/QUALITY_RANK (ya definidos arriba) sigan pudiendo mapearlo
+ * a resolución/orden y las fuentes salgan ordenadas de mayor a menor calidad.
+ */
 function collectMp4Urls(meta) {
     let urls = [];
-    if (!safeObj(meta) || !Array.isArray(meta.videos)) return urls;
-    for (let i = 0; i < meta.videos.length; i++) {
-        let v = meta.videos[i];
+    if (!safeObj(meta)) return urls;
+
+    let vids = Array.isArray(meta.videos) ? meta.videos.slice(0) : [];
+    for (let i = 0; i < vids.length; i++) {
+        let v = vids[i];
         if (!v || !v.url) continue;
-        let url = normalizeUrl(v.url);
-        if (!isHttpUrl(url)) continue;
-        let dup = false;
-        for (let j = 0; j < urls.length; j++) {
-            if (urls[j].url === url) { dup = true; break; }
-        }
-        if (dup || urls.length >= MAX_SOURCES) continue;
-        urls.push({ url: url, label: safeStr(v.name || "") });
+        pushUniqueQuality(urls, v.url, v.name || "");
     }
-    urls.sort(function (a, b) {
-        let qa = qualityInfo(a.label);
-        let qb = qualityInfo(b.label);
-        return (qb ? qb.order : -1) - (qa ? qa.order : -1);
-    });
-    return urls;
+
+    return sortByQuality(urls);
 }
 
 function firstValue(obj, keys) {
     if (!safeObj(obj)) return "";
+
     for (let i = 0; i < keys.length; i++) {
+        let k = keys[i];
+
         try {
-            let v = obj[keys[i]];
-            if (v === undefined || v === null || typeof v === "object") continue;
+            let v = obj[k];
+            if (v === undefined || v === null) continue;
+            if (typeof v === "object") continue; // evita "[object Object]"
             let s = safeStr(v);
             if (s) return s;
         } catch (_) {}
     }
+
     return "";
 }
 
 function getTitle(meta, fallback, id) {
+    // En muchos videos el nombre viene en meta.movie.title.
     let v = "";
     if (safeObj(meta) && safeObj(meta.movie)) {
         v = cleanText(meta.movie.title || meta.movie.name || "");
     }
     if (!v) {
-        v = cleanText(firstValue(meta, ["title", "name", "movieTitle", "videoTitle", "caption"]));
+        v = cleanText(firstValue(meta, [
+            "title",
+            "name",
+            "movieTitle",
+            "videoTitle",
+            "caption"
+        ]));
     }
-    if (v && (/^\d+$/.test(v) || (id && v === safeStr(id)))) v = "";
+
+    // FIX: cuando el video no tiene título propio, OK.ru a veces devuelve
+    // en "title"/"name" el mismo ID numérico del video en vez de dejarlo
+    // vacío. Eso pisaba el título recordado de la búsqueda (ej. "Historia
+    // de Evan") con algo como "9132112939654". Si el valor es puramente
+    // numérico, o es exactamente el ID, se descarta y se usa el fallback.
+    if (v && (/^\d+$/.test(v) || (id && v === safeStr(id)))) {
+        v = "";
+    }
+
+    let fb = cleanText(fallback);
+
+    // OK.ru a veces manda: See video "Nombre" on OK. Video Player
     let wrapped = /see video\s+["«“'](.+?)["»”']/i.exec(v);
     if (wrapped) v = cleanText(wrapped[1]);
-    let fb = cleanText(fallback);
-    if (/see video|on ok\.?\s*video player/i.test(v) && fb && !/see video/i.test(fb)) return fb;
+    if (/see video|on ok\.?\s*video player/i.test(v) && fb && !/see video/i.test(fb)) {
+        return fb;
+    }
+
     return v || fb || "OK.ru video";
 }
 
 function getPoster(meta) {
-    if (safeObj(meta) && safeObj(meta.movie) && meta.movie.poster) return safeStr(meta.movie.poster);
-    return firstValue(meta, ["poster", "posterUrl", "thumbnail", "thumbnailUrl", "cover", "image", "preview"]);
+    if (safeObj(meta) && safeObj(meta.movie) && meta.movie.poster) {
+        return safeStr(meta.movie.poster);
+    }
+    return firstValue(meta, [
+        "poster",
+        "posterUrl",
+        "thumbnail",
+        "thumbnailUrl",
+        "cover",
+        "coverUrl",
+        "image",
+        "imageUrl",
+        "preview"
+    ]);
 }
 
 function getDuration(meta) {
@@ -479,164 +791,721 @@ function getDuration(meta) {
     if (safeObj(meta) && safeObj(meta.movie)) {
         v = firstValue(meta.movie, ["duration", "durationMs", "durationSec"]);
     }
-    if (!v) v = firstValue(meta, ["duration", "durationMs", "durationSec", "length"]);
+    if (!v) {
+        v = firstValue(meta, [
+            "duration",
+            "durationMs",
+            "durationSec",
+            "length",
+            "videoDuration"
+        ]);
+    }
+
     let n = parseFloat(v);
     if (!isFinite(n) || n <= 0) return 0;
+
+    // GrayJay espera segundos. movie.duration de OK.ru ya viene en segundos
+    // (ej. 1037 = 17 min); solo se divide si es un número enorme (ms).
     if (n > 100000) n = n / 1000;
+
     return Math.round(n);
 }
 
-function getAuthorName(meta) {
-    let direct = cleanText(firstValue(meta, ["authorName", "author", "ownerName", "uploader", "userName"]));
-    if (direct && typeof meta.author !== "object") return direct;
-    if (direct && !safeObj(meta.author)) return direct;
-    let containers = [meta.author, meta.owner, meta.user];
-    for (let i = 0; i < containers.length; i++) {
-        if (safeObj(containers[i])) {
-            let n = firstValue(containers[i], ["name", "displayName", "fullName", "userName"]);
-            if (n) return cleanText(n);
+function authorKindOf(meta, author) {
+    let blob = (
+        firstValue(meta, ["provider", "ownerType", "authorType"]) + " " +
+        firstValue(author, ["type", "kind", "provider"])
+    ).toLowerCase();
+    if (/group|community|grupo/.test(blob)) return "group";
+    if (/album|compilation|channel/.test(blob)) return "album";
+    return "user";
+}
+
+function channelUrlFor(id, kind) {
+    id = safeStr(id).replace(/\D/g, "");
+    if (!id) return "";
+    if (kind === "group") return "https://ok.ru/group/" + id + "/video";
+    if (kind === "album") return "https://ok.ru/video/c" + id;
+    return "https://ok.ru/profile/" + id + "/video";
+}
+
+function authorAvatar(author) {
+    if (!safeObj(author)) return "";
+    return normalizeUrl(firstValue(author, [
+        "avatar",
+        "avatarUrl",
+        "photo",
+        "photoUrl",
+        "image",
+        "imageUrl",
+        "thumbnail",
+        "thumbnailUrl",
+        "urlPic"
+    ]), "https://ok.ru/");
+}
+
+function pickAuthorObject(meta) {
+    if (!safeObj(meta)) return null;
+    let list = [meta.author, meta.owner, meta.user, meta.uploader];
+    if (safeObj(meta.movie)) {
+        list.push(meta.movie.author, meta.movie.owner, meta.movie.user);
+    }
+    for (let i = 0; i < list.length; i++) {
+        if (safeObj(list[i]) && (list[i].id || list[i].name || list[i].title)) return list[i];
+    }
+    return null;
+}
+
+function getAuthorInfo(meta, html) {
+    let author = pickAuthorObject(meta);
+    let id = "";
+    let name = "";
+    let kind = "user";
+    let avatar = "";
+
+    if (author) {
+        id = safeStr(firstValue(author, ["id", "userId", "uid", "ownerId", "groupId"]));
+        name = cleanText(firstValue(author, ["name", "displayName", "fullName", "userName", "username", "nickName", "title"]));
+        kind = authorKindOf(meta, author);
+        avatar = authorAvatar(author);
+    }
+    if (!id && safeObj(meta) && safeObj(meta.movie)) {
+        id = safeStr(firstValue(meta.movie, ["ownerId", "userId", "groupId", "authorId"]));
+        if (meta.movie.groupId && safeStr(meta.movie.groupId) === id) kind = "group";
+    }
+    if (!name) name = getAuthorName(meta);
+
+    html = safeStr(html);
+    if (!id && html) {
+        let gm = html.match(/\/(?:group)\/(\d{3,})/i);
+        let pm = html.match(/\/(?:profile)\/(\d{3,})/i);
+        if (gm && !pm) {
+            id = gm[1];
+            kind = "group";
+        } else if (pm) {
+            id = pm[1];
+            kind = "user";
         }
     }
-    return direct || "";
+    if (id && /^\d+$/.test(name)) name = "";
+    if (!name) name = "OK.ru";
+
+    return {
+        id: id,
+        name: name,
+        kind: kind,
+        avatar: avatar,
+        url: channelUrlFor(id, kind)
+    };
 }
 
-function getDescription(meta) {
-    return cleanText(firstValue(meta, ["description", "desc", "text", "summary"]));
-}
-
-function makeHlsSource(url, duration) {
+function makeAuthorLink(info) {
+    info = info || {};
+    let name = cleanText(info.name) || "OK.ru";
+    let id = safeStr(info.id);
+    let url = safeStr(info.url);
+    if (!url && id) url = channelUrlFor(id, info.kind || "user");
     try {
-        return new HLSSource({
-            name: "OK.ru Auto HLS",
-            duration: duration || 0,
-            url: url
-        });
-    } catch (e) {
-        addDebug("HLSSource: " + e);
+        return new PlatformAuthorLink(
+            new PlatformID(PLATFORM_NAME, id || "ok", PLUGIN_ID),
+            name,
+            url,
+            isHttpUrl(info.avatar) ? info.avatar : "",
+            0
+        );
+    } catch (_) {
         return null;
     }
 }
 
+function authorFromBlock(block) {
+    block = safeStr(block);
+    let id = "";
+    let kind = "user";
+    let gm = block.match(/\/group\/(\d{3,})/i);
+    let pm = block.match(/\/profile\/(\d{3,})/i);
+    if (gm && !pm) {
+        id = gm[1];
+        kind = "group";
+    } else if (pm) {
+        id = pm[1];
+    }
+    let name = "";
+    let nm = block.match(/class=["'][^"']*(?:author|owner|user-name|channel)[^"']*["'][^>]*>([\s\S]{1,200}?)<\//i);
+    if (nm) name = cleanText(nm[1]);
+    if (isGenericTitle(name) || /^OK\.ru\b/i.test(name)) name = "";
+    if (!id && !name) return null;
+    return { id: id, name: name || "OK.ru", kind: kind, url: channelUrlFor(id, kind), avatar: "" };
+}
+
+function getAuthorName(meta) {
+    let direct = cleanText(
+        firstValue(meta, [
+            "authorName",
+            "author",
+            "ownerName",
+            "uploader",
+            "userName",
+            "username"
+        ])
+    );
+
+    if (direct) return direct;
+
+    let containers = [meta.author, meta.owner, meta.user, meta.uploader];
+
+    for (let i = 0; i < containers.length; i++) {
+        if (safeObj(containers[i])) {
+            let n = firstValue(containers[i], [
+                "name",
+                "displayName",
+                "fullName",
+                "userName",
+                "username",
+                "nickName"
+            ]);
+            if (n) return cleanText(n);
+        }
+    }
+
+    return "";
+}
+
+function getDescription(meta) {
+    return cleanText(
+        firstValue(meta, [
+            "description",
+            "desc",
+            "text",
+            "summary"
+        ])
+    );
+}
+
+/*
+ * Xuper-compatible fallback.
+ *
+ * Verified APK field names include:
+ *   play_params
+ *   verificationToken / verification_token
+ *   playlistUrl
+ *   signdata
+ *
+ * We only consume a playlist URL that is already present in metadata.
+ * We intentionally do not fabricate a signer, token generator, or private
+ * Xuper endpoint because those are implementation-specific.
+ */
+function xuperGetPlayParams(meta) {
+    return firstValue(meta, ["play_params", "playParams"]);
+}
+
+function xuperGetVerificationToken(meta) {
+    return firstValue(meta, ["verificationToken", "verification_token"]);
+}
+
+function xuperGetPlaylistUrl(meta) {
+    return firstValue(meta, ["playlistUrl", "playlist_url"]);
+}
+
+function xuperGetSignature(meta) {
+    return firstValue(meta, ["signdata", "signature", "sign"]);
+}
+
+function xuperResolve(meta) {
+    if (!safeObj(meta)) return "";
+
+    let direct = xuperGetPlaylistUrl(meta);
+    if (isM3u8Url(direct)) return normalizeUrl(direct);
+
+    // Some responses nest the Xuper fields.
+    let containers = [
+        meta.xuper,
+        meta.data,
+        meta.result,
+        meta.auth,
+        meta.player,
+        meta.flashvars
+    ];
+
+    for (let i = 0; i < containers.length; i++) {
+        if (!safeObj(containers[i])) continue;
+
+        let u = xuperGetPlaylistUrl(containers[i]);
+        if (isM3u8Url(u)) return normalizeUrl(u);
+    }
+
+    return "";
+}
+
+// CAST / PlayPelis vs GrayJay:
+// - PlayPelis descarga el master/segmentos en el mismo proceso que parsea HTML.
+// - GrayJay: el script solo entrega URLs; ExoPlayer/Chromecast las pide aparte.
+//   La cookie de sesión aplica a la página HTML, NO al CDN firmado (okcdn.ru).
+// - Plugins reales (Rumble, etc.) no ponen requestModifier en HLSSource.
+// - Con Origin/Referer/Cookie en el stream: a menudo 00:00 en player o Cast roto.
+// - ENABLE_SOURCE_HEADERS=false = mismo comportamiento que OkRuScript_v12_CAST.
+const ENABLE_SOURCE_HEADERS = true; // CAST: headers en el stream rompen Chromecast y a veces el player
+// Orden de fuentes. false = comportamiento worker-cast (MP4 HD primero si la
+// calidad es conocida, luego HLS). true = HLS master primero (útil si algún
+// video con MP4 enorme no arranca).
+const PREFER_HLS_FIRST = true; // CAST: master HLS primero; MP4 como fallback
+const HLS_DIAG = false;
+const HLS_PROBE = false;
+let LAST_PAGE_MODE = "";
+// Origin no es necesario para el reproductor y algunos CDN de OK.ru lo
+// rechazan en determinadas URLs firmadas. Referer/UA se conservan.
+const SEND_ORIGIN_TO_PLAYER = true; // solo para HLS
+const SEND_COOKIE_TO_VIDEO_PLAYER = false;
+
+function okRequestModifier(withOrigin) {
+    let h = {
+        "User-Agent": UA_DESKTOP
+        // Se elimina Referer y Origin. Cast falla por políticas CORS 
+        // si se incluyen, y OK.ru solo bloquea el User-Agent de ExoPlayer.
+    };
+    
+    return {
+        headers: h,
+        modifyRequest: function (url, headers) {
+            headers = headers || {};
+            for (let k in h) headers[k] = h[k];
+            return { url: url, headers: headers };
+        }
+    };
+}
+
+function makeHlsSource(url, duration, mode) {
+    // mode: undefined/"full" = UA+Referer+Origin; "noorigin"; "none" = sin requestModifier
+    try {
+        let opts = {
+            name: "OK.ru HLS",
+            duration: duration || 0,
+            url: url
+        };
+        if (ENABLE_SOURCE_HEADERS && mode !== "none") {
+            opts.requestModifier = okRequestModifier(mode === "noorigin" ? false : SEND_ORIGIN_TO_PLAYER);
+        }
+        return new HLSSource(opts);
+    } catch (e) {
+        addDebug("makeHlsSource EXCEPTION: " + e);
+    }
+
+    return null;
+}
+
+// FIX (calidad de cast): cuando el metadata solo trae UNA url .m3u8, en
+// muchos casos es un MASTER playlist (adaptativo) con varias variantes
+// adentro (#EXT-X-STREAM-INF). Dentro de la app, el player local sí sabe
+// elegir la mejor variante del master, pero al castear a Chromecast el
+// receptor puede terminar quedándose con la variante más baja. La forma
+// confiable de evitar eso es bajar el master, leer sus variantes reales
+// (BANDWIDTH/RESOLUTION) y ofrecerlas como fuentes HLS separadas y
+// nombradas (ej. "OK.ru HLS 1080p"), de mayor a menor calidad, en vez de
+// depender de que el receptor negocie bien el ABR del master.
+function resolveM3u8Uri(uri, masterUrl) {
+    uri = cleanUrl(uri);
+    if (!uri) return "";
+    if (/^https?:\/\//i.test(uri)) return uri;
+
+    try {
+        if (uri.indexOf("//") === 0) return "https:" + uri;
+
+        if (uri.indexOf("/") === 0) {
+            let m = safeStr(masterUrl).match(/^(https?:\/\/[^/]+)/i);
+            return m ? m[1] + uri : uri;
+        }
+
+        let noQuery = safeStr(masterUrl).split("?")[0];
+        let baseDir = noQuery.substring(0, noQuery.lastIndexOf("/") + 1);
+        return baseDir + uri;
+    } catch (_) {
+        return normalizeUrl(uri, masterUrl);
+    }
+}
+
+function fetchTextWithOkHeaders(url) {
+    try {
+        let headers = {
+            "User-Agent": UA_DESKTOP,
+            "Referer": "https://ok.ru/",
+            "Origin": "https://ok.ru",
+            "Accept": "*/*"
+        };
+        // Sin Cookie deliberadamente: esto es lectura del manifest durante
+        // la extracción de variantes, no búsqueda.
+        let r = http.GET(url, headers);
+        if (!r) return "";
+        let body = "";
+        try { body = r.body; } catch (_) {}
+        if (!body) { try { body = r.getBody(); } catch (_) {} }
+        return safeStr(body);
+    } catch (_) {
+        return "";
+    }
+}
+
+function expandHlsVariants(masterUrl) {
+    let out = [];
+    try {
+        let body = fetchTextWithOkHeaders(masterUrl);
+        addDebug("m3u8 fetch: len=" + (body ? body.length : 0) +
+            " preview=" + safeStr(body).substring(0, 90).replace(/[\r\n]+/g, "\\n"));
+
+        if (!body || body.indexOf("#EXT-X-STREAM-INF") < 0) {
+            addDebug("expandHlsVariants: no es un master playlist (o vacío)");
+            return out;
+        }
+
+        let lines = body.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            let line = lines[i];
+            if (line.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+
+            let uriLine = "";
+            for (let j = i + 1; j < lines.length; j++) {
+                let t = lines[j].trim();
+                if (!t || t.charAt(0) === "#") continue;
+                uriLine = t;
+                break;
+            }
+            if (!uriLine) continue;
+
+            let bandwidth = 0;
+            let bm = line.match(/BANDWIDTH=(\d+)/i);
+            if (bm) bandwidth = parseInt(bm[1], 10) || 0;
+
+            let width = 0, height = 0;
+            let rm = line.match(/RESOLUTION=(\d+)x(\d+)/i);
+            if (rm) {
+                width = parseInt(rm[1], 10) || 0;
+                height = parseInt(rm[2], 10) || 0;
+            }
+
+            let variantUrl = resolveM3u8Uri(uriLine, masterUrl);
+            if (!isHttpUrl(variantUrl)) continue;
+
+            out.push({ url: variantUrl, width: width, height: height, bandwidth: bandwidth });
+        }
+    } catch (e) {
+        addDebug("expandHlsVariants EXCEPTION: " + e);
+    }
+
+    out.sort(function (a, b) {
+        if (b.height !== a.height) return b.height - a.height;
+        return b.bandwidth - a.bandwidth;
+    });
+
+    return out;
+}
+
+function makeHlsVariantSource(variant, duration) {
+    let src = makeHlsSource(variant.url, duration);
+    if (!src) return null;
+    try {
+        let label = variant.height
+            ? (variant.height + "p")
+            : (variant.bandwidth ? Math.round(variant.bandwidth / 1000) + "kbps" : "?");
+        src.name = "OK.ru HLS " + label;
+    } catch (_) {}
+    return src;
+}
+
 function makeMp4Source(url, duration, index, label) {
     try {
+        let lower = safeStr(url).toLowerCase();
+        let container = "mp4";
+
+        if (/\.m4v(?:$|[?#])/.test(lower)) container = "m4v";
+        else if (/\.webm(?:$|[?#])/.test(lower)) container = "webm";
+        else if (/\.mov(?:$|[?#])/.test(lower)) container = "mov";
+
         let q = qualityInfo(label);
         let name = q
-            ? ("OK.ru " + label.toUpperCase() + " (" + q.height + "p)")
-            : ("OK.ru MP4 " + (index + 1));
-        return new VideoUrlSource({
+            ? "OK.ru " + label.toUpperCase() + " (" + q.height + "p)"
+            : "OK.ru " + container.toUpperCase() + " " + (index + 1);
+
+        let opts = {
             width: q ? Math.round(q.height * 16 / 9) : 0,
             height: q ? q.height : 0,
-            container: "video/mp4",
+            container: container === "mp4" ? "video/mp4" : "video/" + container,
             codec: "",
             name: name,
             bitrate: q ? estimateBitrate(q.height) : 0,
             duration: duration || 0,
             url: url
-        });
+        };
+        if (ENABLE_SOURCE_HEADERS) opts.requestModifier = okRequestModifier(false);
+        return new VideoUrlSource(opts);
     } catch (e) {
-        addDebug("VideoUrlSource: " + e);
-        return null;
+        addDebug("makeMp4Source EXCEPTION: " + e);
     }
-}
 
-function extractYouTubeId(value) {
-    let x = safeStr(value).replace(/\\u002F/gi, "/").replace(/\\\//g, "/").replace(/&/gi, "&");
-    let patterns = [
-        /(?:youtube(?:-nocookie)?\.com\/(?:embed|shorts|live|v)\/)([A-Za-z0-9_-]{11})/i,
-        /(?:youtube(?:-nocookie)?\.com\/watch\?(?:[^"'<>]*&)?v=)([A-Za-z0-9_-]{11})/i,
-        /youtu\.be\/([A-Za-z0-9_-]{11})/i
-    ];
-    for (let i = 0; i < patterns.length; i++) {
-        let m = x.match(patterns[i]);
-        if (m) return m[1];
-    }
-    return "";
-}
-
-function extractExternalEmbed(value) {
-    let yt = extractYouTubeId(value);
-    if (yt) return { plugin: "YouTube", url: "https://www.youtube.com/watch?v=" + yt };
     return null;
+}
+
+
+function probeShort(body) {
+    return safeStr(body).substring(0, 70).replace(/[^\x20-\x7e]+/g, " ").trim();
+}
+
+function probeMaskUrl(url) {
+    url = safeStr(url);
+    let host = getHost(url);
+    let keep = [];
+    let names = ["type", "ct", "clientType", "srcAg", "pr", "expires"];
+    for (let i = 0; i < names.length; i++) {
+        let m = url.match(new RegExp("[?&]" + names[i] + "=([^&]*)", "i"));
+        if (m) keep.push(names[i] + "=" + m[1]);
+    }
+    let path = url.replace(/^https?:\/\/[^/]+/i, "").split("?")[0];
+    return host + path + " ?" + keep.join("&") + (/[?&]sig=/i.test(url) ? " &sig=…" : " (SIN sig)");
+}
+
+function probeGet(url, headers, auth, range) {
+    let h = {};
+    for (let k in headers) h[k] = headers[k];
+    if (range) h["Range"] = "bytes=0-1023";
+    let r;
+    try {
+        r = auth ? http.GET(url, h, true) : http.GET(url, h);
+    } catch (e) {
+        return { code: "ERR", body: "", note: safeStr(e).substring(0, 60) };
+    }
+    let code = "?";
+    try { code = r.code; } catch (_) {}
+    let body = readBody(r);
+    return { code: code, body: body, note: "" };
+}
+
+function probeHls(masterUrl) {
+    let lines = [];
+    lines.push("[DIAG HLS v36] página: " + (LAST_PAGE_MODE || "?"));
+    lines.push("master: " + probeMaskUrl(masterUrl));
+
+    let base = { "User-Agent": UA_DESKTOP, "Referer": "https://ok.ru/", "Accept": "*/*" };
+    let withOrigin = { "User-Agent": UA_DESKTOP, "Referer": "https://ok.ru/", "Origin": "https://ok.ru", "Accept": "*/*" };
+    let tests = [
+        { n: "sin sesión, UA+Ref+Origin", h: withOrigin, a: false },
+        { n: "sin sesión, UA+Ref", h: base, a: false },
+        { n: "sin sesión, sin headers", h: {}, a: false },
+        { n: "CON sesión, UA+Ref", h: base, a: true }
+    ];
+
+    let best = null;
+    for (let i = 0; i < tests.length; i++) {
+        let t = tests[i];
+        let res = probeGet(masterUrl, t.h, t.a, false);
+        let isM3u = safeStr(res.body).indexOf("#EXTM3U") >= 0;
+        lines.push("master " + t.n + ": HTTP " + res.code + " len=" + safeStr(res.body).length +
+            (isM3u ? " M3U8-OK" : "") + " [" + probeShort(res.body) + "]" + (res.note ? " " + res.note : ""));
+        if (isM3u && !best) best = { body: res.body, t: t };
+    }
+
+    if (!best) {
+        lines.push("=> el master no se puede leer desde JS en ninguna variante");
+        return lines.join("\n");
+    }
+
+    // Primera línea de URL (variante o segmento).
+    let bl = best.body.split(/\r?\n/);
+    let next = "";
+    for (let i = 0; i < bl.length; i++) {
+        let l = bl[i].trim();
+        if (l && l.charAt(0) !== "#") { next = l; break; }
+    }
+    if (!next) { lines.push("master sin URIs"); return lines.join("\n"); }
+
+    let nextUrl = resolveM3u8Uri(next, masterUrl);
+    lines.push("sub-URL: " + probeMaskUrl(nextUrl));
+    let r2 = probeGet(nextUrl, best.t.h, best.t.a, false);
+    let isM3u2 = safeStr(r2.body).indexOf("#EXTM3U") >= 0;
+    lines.push("variante: HTTP " + r2.code + " len=" + safeStr(r2.body).length + (isM3u2 ? " M3U8-OK" : "") +
+        " [" + probeShort(r2.body) + "]");
+
+    if (isM3u2) {
+        let sl = r2.body.split(/\r?\n/);
+        let seg = "";
+        for (let i = 0; i < sl.length; i++) {
+            let l = sl[i].trim();
+            if (l && l.charAt(0) !== "#") { seg = l; break; }
+        }
+        if (seg) {
+            let segUrl = resolveM3u8Uri(seg, nextUrl);
+            lines.push("segmento: " + probeMaskUrl(segUrl));
+            let r3 = probeGet(segUrl, best.t.h, best.t.a, true);
+            lines.push("segmento (Range 1KB): HTTP " + r3.code + " len=" + safeStr(r3.body).length);
+        }
+    }
+    return lines.join("\n");
 }
 
 function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     if (!safeObj(meta)) throw new Error("No metadata");
 
-    let id = extractVideoId(pageUrl);
-    let title = getTitle(meta, fallbackTitle, id);
+    let title = getTitle(meta, fallbackTitle, extractVideoId(pageUrl));
     let poster = normalizeUrl(getPoster(meta), pageUrl);
     let duration = getDuration(meta);
-    let authorName = getAuthorName(meta) || "OK.ru";
-    let hls = collectHlsUrls(meta);
-    let mp4 = collectMp4Urls(meta);
+    let authorInfo = getAuthorInfo(meta, html);
+    let authorName = authorInfo.name || "OK.ru";
 
-    addDebug("sources hls=" + hls.length + " mp4=" + mp4.length);
+    let hls = [];
+    let xuperPlaylist = xuperResolve(meta);
 
-    let sources = [];
-    let best = mp4.length ? mp4[0] : null;
-    let bestQ = best ? qualityInfo(best.label) : null;
-    let mp4First = bestQ && bestQ.order >= 70;
-
-    if (mp4First) {
-        let src = makeMp4Source(best.url, duration, 0, best.label);
-        if (src) sources.push(src);
+    if (isM3u8Url(xuperPlaylist)) {
+        pushUnique(hls, xuperPlaylist);
     }
+
+    let normalHls = collectHlsUrls(meta);
+    for (let i = 0; i < normalHls.length; i++) {
+        pushUnique(hls, normalHls[i]);
+    }
+
+    let mp4 = collectMp4Urls(meta); // [{url, label}], ya ordenado de mayor a menor calidad
+
+    let mp4Labels = [];
+    for (let i = 0; i < mp4.length; i++) mp4Labels.push(mp4[i].label || "?");
+    addDebug("sources hls=" + hls.length + " mp4=" + mp4.length +
+        (mp4.length ? " labels=[" + mp4Labels.join(",") + "]" : ""));
+    if (hls.length > 0) addDebug("hls[0] url=" + hls[0]);
+
+    let probeText = "";
+    if (HLS_PROBE && hls.length > 0) {
+        try { probeText = probeHls(hls[0]); } catch (pe) { probeText = "[DIAG HLS] error: " + pe; }
+    }
+
+    /*
+     * RUTA RÁPIDA:
+     * No descargamos el master .m3u8 desde JS. Esa petición agrega latencia
+     * y, según las pruebas ya documentadas en este archivo, suele responder
+     * vacío desde el contexto del script mientras ExoPlayer/GrayJay sí puede
+     * leer el master directamente.
+     *
+     * Para Cast, si OK.ru entregó un MP4 cuya calidad conocemos y es HD,
+     * lo ponemos primero. Así el receptor recibe una fuente explícitamente
+     * etiquetada con la mejor calidad conocida, en lugar de arrancar con ABR.
+     * Si no hay MP4 HD conocido, mantenemos el HLS master como primera opción.
+     */
+    let sources = [];
+
+    // v33: HLS primero. En v32 se priorizaba un MP4 HD si existía; en
+    // determinados videos esa URL directa existe pero no inicia en el player
+    // o en Cast, mientras que el HLS firmado sí funciona. Dejamos MP4 como
+    // fallback para no perder compatibilidad.
+    let bestMp4Index = -1;
+    let bestMp4Order = -1;
+
+    for (let j = 0; j < mp4.length; j++) {
+        let q = qualityInfo(mp4[j].label);
+        let order = q ? q.order : -1;
+        if (order > bestMp4Order) {
+            bestMp4Order = order;
+            bestMp4Index = j;
+        }
+    }
+
+    if (bestMp4Index < 0 && mp4.length > 0) bestMp4Index = 0;
+
+    if (PREFER_HLS_FIRST) {
+        addDebug("v33 source order: HLS first; MP4 fallback");
+    } else if (bestMp4Index >= 0) {
+        let bestSrc = makeMp4Source(
+            mp4[bestMp4Index].url,
+            duration,
+            bestMp4Index,
+            mp4[bestMp4Index].label
+        );
+        if (bestSrc) {
+            sources.push(bestSrc);
+            addDebug("CAST primary: MP4 " + (mp4[bestMp4Index].label || "?"));
+        }
+    }
+
+    // HLS master directo, sin round-trip adicional.
     for (let i = 0; i < hls.length && sources.length < MAX_SOURCES; i++) {
         let src = makeHlsSource(hls[i], duration);
         if (src) {
-            src.name = "OK.ru Auto HLS";
+            src.name = i === 0 ? "OK.ru Auto HLS (Master)" : "OK.ru HLS " + (i + 1);
             sources.push(src);
         }
+        if (HLS_DIAG && i === 0) {
+            let d1 = makeHlsSource(hls[i], duration, "noorigin");
+            if (d1) { d1.name = "OK.ru HLS diag: sin Origin"; sources.push(d1); }
+            let d2 = makeHlsSource(hls[i], duration, "none");
+            if (d2) { d2.name = "OK.ru HLS diag: sin headers"; sources.push(d2); }
+        }
     }
+
+    // El resto de MP4 queda como fallback.
     for (let j = 0; j < mp4.length && sources.length < MAX_SOURCES; j++) {
-        if (mp4First && j === 0) continue;
+        if (j === bestMp4Index) continue;
         let src = makeMp4Source(mp4[j].url, duration, j, mp4[j].label);
         if (src) sources.push(src);
     }
 
+    // Sin fuentes propias: si es un embed de otra plataforma, pedir el plugin.
     if (!sources.length) {
-        let ext = extractExternalEmbed(html) || extractExternalEmbed(safeStr(meta.provider));
+        let ext = extractExternalEmbed(html);
         if (!ext) {
             try { ext = extractExternalEmbed(JSON.stringify(meta)); } catch (_) {}
         }
-        if (ext) {
-            throw makeErr("Este video esta en " + ext.plugin + ". Buscalo alla:\n" + ext.url);
-        }
+        if (ext) throw makeErr(installPluginMessage(ext));
+    }
+
+    if (!sources.length) {
         throw makeErr("OK.ru: este video no expone fuentes reproducibles.\n" + debugText());
     }
 
     let thumbs = [];
     if (poster && isHttpUrl(poster)) {
-        try { thumbs.push(new Thumbnail(poster, 0)); } catch (_) {}
+        try {
+            thumbs.push(new Thumbnail(poster, 0));
+        } catch (_) {}
     }
+
     let thumbnails;
-    try { thumbnails = new Thumbnails(thumbs); } catch (_) { thumbnails = new Thumbnails([]); }
+    try {
+        thumbnails = new Thumbnails(thumbs);
+    } catch (_) {
+        thumbnails = new Thumbnails([]);
+    }
 
     let author = null;
     try {
-        author = new PlatformAuthorLink(
-            new PlatformID(PLATFORM_NAME, "", PLUGIN_ID),
-            authorName,
-            "https://ok.ru/",
-            "",
-            0
-        );
+        // Nombre real del canal y URL de perfil/grupo para que GrayJay
+        // lo muestre y, al tocarlo, llame a getChannel / getChannelContents.
+        author = makeAuthorLink(authorInfo);
     } catch (_) {}
 
     let descriptor = null;
     try {
-        descriptor = new MuxVideoSourceDescriptor({ isUnMuxed: false, videoSources: sources });
+        descriptor = new MuxVideoSourceDescriptor({
+            isUnMuxed: false,
+            videoSources: sources
+        });
     } catch (e) {
-        try { descriptor = new VideoSourceDescriptor(sources); } catch (e2) {
-            addDebug("descriptor: " + e2);
+        addDebug("MuxVideoSourceDescriptor: " + e);
+
+        try {
+            descriptor = new VideoSourceDescriptor(sources);
+        } catch (e2) {
+            addDebug("VideoSourceDescriptor: " + e2);
         }
     }
-    if (!descriptor) throw new Error("No video source descriptor\n" + debugText());
 
-    let firstHls = hls.length ? makeHlsSource(hls[0], duration) : null;
+    if (!descriptor) {
+        throw new Error("No video source descriptor available\n" + debugText());
+    }
+
+    let firstHls = null;
+    if (hls.length > 0) {
+        firstHls = makeHlsSource(hls[0], duration);
+        addDebug("primary HLS: " + hls[0]);
+    } else if (mp4.length > 0) {
+        addDebug("primary MP4 (" + (mp4[0].label || "?") + "): " + mp4[0].url);
+    }
 
     return new PlatformVideoDetails({
-        id: new PlatformID(PLATFORM_NAME, id || "0", PLUGIN_ID),
+        id: new PlatformID(PLATFORM_NAME, extractVideoId(pageUrl) || "0", PLUGIN_ID),
         name: title,
         thumbnails: thumbnails,
         author: author,
@@ -653,87 +1522,223 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     });
 }
 
-/* ---------- busqueda: 1 request, 1 pasada ---------- */
+
+function parseDurationText(value) {
+    let parts = cleanText(value).split(":");
+    if (parts.length === 2) {
+        return (parseInt(parts[0], 10) || 0) * 60 +
+               (parseInt(parts[1], 10) || 0);
+    }
+    if (parts.length === 3) {
+        return (parseInt(parts[0], 10) || 0) * 3600 +
+               (parseInt(parts[1], 10) || 0) * 60 +
+               (parseInt(parts[2], 10) || 0);
+    }
+    return 0;
+}
 
 function isGenericTitle(t) {
     t = cleanText(t || "").toLowerCase().replace(/[.\u2026:!]+$/g, "").trim();
     if (!t || t.length < 2) return true;
+    // Solo duración / números
     if (/^[\d:\s]+$/.test(t)) return true;
-    if (/^(view|views|ver|watch|play|reproducir|image|video|videos|more|next|previous|menu)$/.test(t)) return true;
+    if (/^(image|video|videos|more|next|previous|menu|play|share|like|comment)$/.test(t)) return true;
+    // "View", "View video", "Views 1.2K", "Ver", "Watch", "Смотреть", "Открыть"...
+    if (/^(view|views|ver|watch|play|reproducir|смотреть|посмотреть|просмотр|просмотры|открыть)\b/.test(t) && t.length <= 28) return true;
+    // Solo "View" / "Ver video" cortos del UI de OK
     if (/^(view|ver|watch)(\s+video)?$/i.test(t)) return true;
     return false;
 }
 
-function titleNear(html, index) {
-    let start = Math.max(0, index - 420);
-    let end = Math.min(html.length, index + 520);
-    let block = html.substring(start, end);
-    let patterns = [
-        /\btitle\s*=\s*["']([^"']{2,300})["']/i,
-        /\baria-label\s*=\s*["']([^"']{2,300})["']/i,
-        /\balt\s*=\s*["']([^"']{2,300})["']/i,
-        /class=["'][^"']*(?:title|name|caption)[^"']*["'][^>]*>([^<]{2,300})</i
-    ];
-    for (let i = 0; i < patterns.length; i++) {
-        let m = patterns[i].exec(block);
-        if (!m) continue;
-        let t = cleanText(m[1]);
-        if (t && !isGenericTitle(t)) return { title: t, block: block };
+function bestAnchorTitle(attrs, inner) {
+    attrs = safeStr(attrs);
+    inner = safeStr(inner);
+    let cands = [];
+    let am = attrs.match(/\btitle\s*=\s*["']([^"']{2,500})["']/i);
+    if (am) cands.push(am[1]);
+    am = attrs.match(/\baria-label\s*=\s*["']([^"']{2,500})["']/i);
+    if (am) cands.push(am[1]);
+    let im = inner.match(/\balt\s*=\s*["']([^"']{2,500})["']/i);
+    if (im) cands.push(im[1]);
+    cands.push(inner);
+    for (let i = 0; i < cands.length; i++) {
+        let c = cleanText(cands[i]);
+        if (c && !isGenericTitle(c)) return c;
     }
-    return { title: "", block: block };
+    return "";
 }
 
-function posterNear(block) {
-    let pm = /(?:src|data-src|data-lazy-src|poster)\s*=\s*["']([^"']+)["']/i.exec(block);
-    if (pm) return normalizeUrl(pm[1]);
-    return "";
+function upgradeSearchTitle(results, idx, id, anchorTitle, anchorAttrs) {
+    let r = results[idx];
+    if (!r || !/^OK\.ru video\b/i.test(r.title)) return;
+    if (r.url.indexOf("https://ok.ru/video/") !== 0) return;
+    let t = bestAnchorTitle(anchorAttrs, anchorTitle);
+    if (!t) return;
+    r.title = t;
+    r.url = "https://ok.ru/video/" + id + "?t=" + encodeURIComponent(t);
+    rememberTitle(id, t);
+}
+
+function addSearchCandidate(results, seen, id, block, anchorTitle, anchorAttrs) {
+    if (!id) return;
+    if (seen[id]) { upgradeSearchTitle(results, seen[id] - 1, id, anchorTitle, anchorAttrs); return; }
+    if (results.length >= 96) return;
+    block = safeStr(block);
+
+    // Embeds de YouTube: se entregan con la URL de YouTube para que los abra
+    // el plugin de YouTube. Otros proveedores externos (vimeo, etc.) se omiten.
+    let ext = extractExternalEmbed(block);
+    if (!ext && containsExternalVideoEmbed(block)) return;
+
+    let title = bestAnchorTitle(anchorAttrs, anchorTitle);
+
+    if (!title || title.length < 2) {
+        let tm = block.match(
+            /(?:data-title|data-name|title)\s*=\s*["']([^"']{2,500})["']/i
+        );
+        if (tm) title = cleanText(tm[1]);
+    }
+    if (isGenericTitle(title)) title = "";
+
+    if (!title) {
+        let tm = block.match(
+            /<(?:span|div|a)[^>]*class=["'][^"']*(?:title|name|caption)[^"']*["'][^>]*>([\s\S]{1,700}?)<\/(?:span|div|a)>/i
+        );
+        if (tm) title = cleanText(tm[1]);
+    }
+    if (isGenericTitle(title)) title = "";
+
+    if (!title) title = "OK.ru video " + id;
+
+    if (/^(image|video|more|next|previous|menu|play)$/i.test(title)) return;
+
+    let poster = "";
+    let pm = block.match(
+        /<(?:img|source)[^>]+(?:src|data-src|data-lazy-src|poster)\s*=\s*["']([^"']+)["']/i
+    );
+    if (pm) poster = normalizeUrl(pm[1]);
+
+    if (!poster) {
+        let pm2 = block.match(
+            /(?:poster|thumbnail|thumbnailUrl|cover|preview)\s*[:=]\s*["']([^"']+)["']/i
+        );
+        if (pm2) poster = normalizeUrl(pm2[1]);
+    }
+
+    let duration = 0;
+    let dm = block.match(
+        /(?:duration|movie-duration|video-duration)[^>:\n]{0,100}[:=]?\s*["']?([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)["']?/i
+    );
+    if (dm) duration = parseDurationText(dm[1]);
+
+    seen[id] = results.length + 1;
+    rememberTitle(id, title);
+    let authorInfo = authorFromBlock(block);
+
+    // FIX real: no dar por sentado que el motor de GrayJay mantiene el
+    // estado de este script (TITLE_CACHE) entre la llamada a search() y la
+    // llamada posterior a getContentDetails(). Para no depender de eso, el
+    // título viaja directamente adentro de la URL que se le entrega a
+    // GrayJay; es la misma URL que después vuelve en getContentDetails(url).
+    let urlWithTitle = ext
+        ? ext.url
+        : ("https://ok.ru/video/" + id +
+            (!/^OK\.ru video\b/i.test(title)
+                ? "?t=" + encodeURIComponent(title)
+                : ""));
+
+    results.push({
+        id: ext ? (ext.plugin.toLowerCase() + ":" + ext.id) : id,
+        url: urlWithTitle,
+        title: title,
+        thumbnail: poster,
+        duration: duration,
+        author: authorInfo
+    });
 }
 
 function extractSearchResults(html) {
     let results = [];
     let seen = {};
     html = safeStr(html);
-    let re = /\/(?:video|videoembed)\/(\d+)/gi;
+
+    // 1) Normal anchors.
+    let re = /<a\b([^>]*?href\s*=\s*["'](?:https?:\/\/[^"']+)?\/(?:video|videoembed)\/(\d+)(?:[?#][^"']*)?["'][^>]*)>([\s\S]*?)<\/a>/gi;
     let m;
-    while ((m = re.exec(html)) !== null && results.length < MAX_SEARCH) {
-        let id = m[1];
-        if (seen[id]) continue;
-        seen[id] = true;
-        let near = titleNear(html, m.index);
-        if (/youtube\.com|youtu\.be/i.test(near.block) && extractYouTubeId(near.block)) continue;
-        let title = near.title || ("OK.ru video " + id);
-        rememberTitle(id, title);
-        let url = "https://ok.ru/video/" + id;
-        if (!/^OK\.ru video\b/i.test(title)) url += "?t=" + encodeURIComponent(title);
-        results.push({
-            id: id,
-            url: url,
-            title: title,
-            thumbnail: posterNear(near.block),
-            duration: 0
-        });
+
+    while ((m = re.exec(html)) !== null && results.length < 96) {
+        let start = Math.max(0, m.index - 400);
+        let end = Math.min(html.length, re.lastIndex + 400);
+        addSearchCandidate(
+            results, seen, m[2],
+            html.substring(start, end),
+            m[3],
+            m[1]
+        );
     }
+
+    // 2) data-movie-id / data-video-id blocks.
+    let re2 = /(?:data-movie-id|data-video-id|data-content-id)\s*=\s*["']?(\d+)["']?/gi;
+    while ((m = re2.exec(html)) !== null && results.length < 96) {
+        let start = Math.max(0, m.index - 400);
+        let end = Math.min(html.length, re2.lastIndex + 600);
+        addSearchCandidate(
+            results, seen, m[1],
+            html.substring(start, end),
+            ""
+        );
+    }
+
+    // 3) JSON/escaped OK.ru video URLs.
+    let re3 = /(?:https?:)?\\?\/\\?\/(?:www\.)?ok\.ru\\?\/(?:video|videoembed)\\?\/(\d+)/gi;
+    while ((m = re3.exec(html)) !== null && results.length < 96) {
+        let start = Math.max(0, m.index - 400);
+        let end = Math.min(html.length, re3.lastIndex + 400);
+        addSearchCandidate(
+            results, seen, m[1],
+            html.substring(start, end),
+            ""
+        );
+    }
+
+    // 4) Raw /video/<id> references.
+    let re4 = /(?:^|["'(\s])\/video\/(\d+)(?:[?#"'()\s]|$)/gi;
+    while ((m = re4.exec(html)) !== null && results.length < 96) {
+        let start = Math.max(0, m.index - 400);
+        let end = Math.min(html.length, re4.lastIndex + 400);
+        addSearchCandidate(
+            results, seen, m[1],
+            html.substring(start, end),
+            ""
+        );
+    }
+
     return results;
 }
 
 function makeSearchVideo(r) {
+    // Persistir el título antes de que GrayJay haga la segunda llamada de
+    // detalles. La URL ya contiene ?t= como segunda barrera.
     try { rememberTitle(r.id, r.title); } catch (_) {}
+
     let thumbs = [];
     if (isHttpUrl(r.thumbnail)) {
         try { thumbs.push(new Thumbnail(r.thumbnail, 0)); } catch (_) {}
     }
+
     let thumbnails;
-    try { thumbnails = new Thumbnails(thumbs); } catch (_) { thumbnails = new Thumbnails([]); }
+    try { thumbnails = new Thumbnails(thumbs); }
+    catch (_) { thumbnails = new Thumbnails([]); }
+
     let author = null;
     try {
-        author = new PlatformAuthorLink(
-            new PlatformID(PLATFORM_NAME, "", PLUGIN_ID),
-            "OK.ru",
-            "https://ok.ru/",
-            "",
-            0
-        );
+        // Consistente con getContentDetails: mostrar un autor en vez de null
+        // para que la tarjeta de resultados también muestre algo en "autor".
+        author = r.author && (r.author.id || r.author.name)
+            ? makeAuthorLink(r.author)
+            : makeAuthorLink({ name: "OK.ru" });
     } catch (_) {}
+
     try {
         return new PlatformVideo({
             id: new PlatformID(PLATFORM_NAME, r.id, PLUGIN_ID),
@@ -746,23 +1751,24 @@ function makeSearchVideo(r) {
             viewCount: 0,
             isLive: false
         });
-    } catch (_) { return null; }
+    } catch (_) {
+        return null;
+    }
 }
 
 function fetchSearchPage(query, page) {
     let url = SEARCH_URL_BASE + encodeURIComponent(safeStr(query));
     if (page > 1) url += "&st.page=" + page;
-    let headers = pageHeaders();
-    let html = "";
-    try {
-        html = readBody(http.GET(url, headers, true));
-    } catch (e) {
-        addDebug("search sin sesion: " + e);
+
+    // La búsqueda de OK.ru exige sesión: se usa la del Login de GrayJay.
+    let html = httpGetAuthenticated(url);
+    addDebug("search page " + page + " bytes=" + (html ? html.length : 0));
+
+    let hasVideos = /\/(?:video|videoembed)\/\d+/i.test(safeStr(html));
+    if (!hasVideos && (page <= 1 || looksLikeLoginWall(html))) {
+        // Sin enlaces a videos en la primera página (o pared de login): no hay sesión.
         throw makeErr(LOGIN_MSG);
     }
-    addDebug("search p" + page + " bytes=" + (html ? html.length : 0));
-    let hasVideos = /\/(?:video|videoembed)\/\d+/i.test(html);
-    if (!hasVideos && (page <= 1 || looksLikeLoginWall(html))) throw makeErr(LOGIN_MSG);
     return html || "";
 }
 
@@ -776,18 +1782,41 @@ function searchOk(query, continuationToken) {
         }
     } catch (_) {}
 
+    // FIX (velocidad): antes se traían 4 páginas (hasta 8 requests con
+    // reintento autenticado/no autenticado) ANTES de devolver el primer
+    // resultado a GrayJay, lo que explicaba el ~1min para "encontrar
+    // videos". Ahora se trae 1 sola página por llamada; GrayJay pide la
+    // siguiente automáticamente vía nextPage() cuando el usuario hace
+    // scroll, así el primer resultado aparece mucho antes.
     let html = fetchSearchPage(query, page);
     if (!html) throw new Error("OK.ru search returned no data");
+
     let found = extractSearchResults(html);
-    let out = [];
+
+    let raw = [];
+    let seen = {};
     for (let i = 0; i < found.length; i++) {
-        let v = makeSearchVideo(found[i]);
+        if (!seen[found[i].id]) {
+            seen[found[i].id] = true;
+            raw.push(found[i]);
+        }
+    }
+
+    let out = [];
+    for (let i = 0; i < raw.length; i++) {
+        let v = makeSearchVideo(raw[i]);
         if (v) out.push(v);
     }
-    return new OkSearchPager(out, found.length > 0, {
+
+    // OK.ru no indica cuál es la última página; mientras la página traiga
+    // resultados asumimos que puede haber más.
+    let hasMore = raw.length > 0;
+    let context = {
         query: safeStr(query),
         page: page + 1
-    });
+    };
+
+    return new OkSearchPager(out, hasMore, context);
 }
 
 class OkSearchPager extends VideoPager {
@@ -800,73 +1829,385 @@ class OkSearchPager extends VideoPager {
     }
 }
 
+function searchSuggestions(query) {
+    let results = [];
+
+    try {
+        let found = searchOk(query);
+        for (let i = 0; i < found.length && results.length < 10; i++) {
+            let r = found[i];
+            let title = r.title || "";
+
+            if (r.details) {
+                try {
+                    title = r.details.title || title;
+                } catch (_) {}
+            }
+
+            if (title) results.push(title);
+        }
+    } catch (e) {
+        addDebug("suggestions: " + e);
+    }
+
+    return results;
+}
+
+function isGenericSiteTitle(t) {
+    let s = cleanText(t).toLowerCase();
+    return !s || s === "ok" || s === "ok.ru" || s === "ok.ru — social network";
+}
+
+function extractPageTitle(html) {
+    let m = safeStr(html).match(/<title[^>]*>([^<]+)<\/title>/i);
+    if (m) {
+        let t = cleanText(m[1])
+            .replace(/^(?:see|watch|ver)\s+video\s+["«“'](.+?)["»”']\s+on\s+ok.*$/i, "$1")
+            .replace(/\s*[|\-–]\s*OK\.?RU.*$/i, "")
+            .replace(/\s+on\s+OK\.?\s*Video Player\s*$/i, "")
+            .trim();
+        if (!isGenericSiteTitle(t)) return t;
+    }
+
+    m = safeStr(html).match(
+        /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
+    );
+    if (m) {
+        let t = cleanText(m[1]);
+        if (!isGenericSiteTitle(t)) return t;
+    }
+
+    return "";
+}
+
 function doDetails(url) {
     resetDebug();
     let tStart = nowMs();
+
     let id = extractVideoId(url);
     if (!id) throw new Error("Invalid OK.ru video URL");
 
     let cached = getCachedDetails(id);
     if (cached) {
+        // Si GrayJay vuelve con la URL que conserva ?t=<titulo>, úsalo para
+        // corregir una tarjeta que haya quedado con el ID como nombre.
         let requestedTitle = extractTitleParam(url);
         if (requestedTitle && !/^OK\.ru video\b/i.test(requestedTitle)) {
-            try { cached.name = requestedTitle; rememberTitle(id, requestedTitle); } catch (_) {}
+            try {
+                cached.name = requestedTitle;
+                rememberTitle(id, requestedTitle);
+            } catch (_) {}
         }
+        addDebug("details cache HIT: " + id);
         return cached;
     }
 
-    let canonical = "https://ok.ru/video/" + id;
-    let loaded = loadMetadata(id, canonical);
-    if (!loaded.meta) {
-        throw new Error("OK.ru metadata not found.\n" + debugText());
+    let canonical =
+        "https://ok.ru/video/" + id;
+
+    addDebug("Video ID: " + id);
+
+    let tLoad = nowMs();
+    let html = loadOkPage(canonical, id);
+    addDebug("loadOkPage TOTAL: " + (nowMs() - tLoad) + "ms");
+
+    if (!html) {
+        throw new Error("Unable to load OK.ru video page");
     }
 
+    let meta = parseMetadata(html, canonical);
+
+    if (!meta) {
+        throw new Error(
+            "OK.ru metadata not found. Debug:\n" + debugText()
+        );
+    }
+
+    if (meta && meta.error) addDebug("OK meta.error: " + meta.error);
+    addDebug(
+        "Xuper fields: play_params=" +
+        (xuperGetPlayParams(meta) ? "yes" : "no") +
+        ", verificationToken=" +
+        (xuperGetVerificationToken(meta) ? "yes" : "no") +
+        ", playlistUrl=" +
+        (xuperGetPlaylistUrl(meta) ? "yes" : "no") +
+        ", signdata=" +
+        (xuperGetSignature(meta) ? "yes" : "no")
+    );
+
+    // Orden de confianza: título embebido en la URL que llegó (viaja desde
+    // la búsqueda sin depender de estado en memoria) > título recordado en
+    // memoria (por si el motor sí conserva el contexto) > título de la
+    // página > genérico con el ID como último recurso.
     let fallbackTitle =
         extractTitleParam(url) ||
         recallTitle(id) ||
+        extractPageTitle(html) ||
         ("OK.ru video " + id);
 
-    let details = buildVideoDetails(loaded.meta, canonical, fallbackTitle, loaded.html);
+    let details = buildVideoDetails(meta, canonical, fallbackTitle, html);
+
     putCachedDetails(id, details);
-    addDebug("doDetails " + (nowMs() - tStart) + "ms");
+    addDebug("doDetails TOTAL: " + (nowMs() - tStart) + "ms");
+
     return details;
 }
 
-/* ------------------------- GrayJay ------------------------- */
+/* ------------------------- GrayJay bindings ------------------------- */
 
-source.setSettings = function () {};
-source.enable = function () { return true; };
+source.setSettings = function (settings) {
+    // Kept for compatibility with GrayJay versions that expect setSettings.
+};
+
+source.enable = function () {
+    return true;
+};
 
 source.getSearchCapabilities = function () {
-    try { return new ResultCapabilities(["video"], [], []); }
-    catch (_) { return { types: ["video"], sorts: [], filters: [] }; }
+    try {
+        return new ResultCapabilities(["video"], [], []);
+    } catch (_) {
+        return {
+            types: ["video"],
+            sorts: [],
+            filters: []
+        };
+    }
 };
 
 source.search = function (query, type, order, filters, continuationToken) {
     return searchOk(query, continuationToken);
 };
 
-source.searchSuggestions = function () {
-    return [];
+source.searchSuggestions = function (query) {
+    return searchSuggestions(query);
 };
 
 source.isContentDetailsUrl = function (url) {
     return REGEX_VIDEO_URL.test(safeStr(url));
 };
+
 source.isVideoDetailsUrl = function (url) {
     return REGEX_VIDEO_URL.test(safeStr(url));
 };
-source.getVideoDetails = function (url) { return doDetails(url); };
-source.getContentDetails = function (url) { return doDetails(url); };
+
+source.getVideoDetails = function (url) {
+    return doDetails(url);
+};
+
+source.getContentDetails = function (url) {
+    return doDetails(url);
+};
 
 class OkHomePager extends VideoPager {
     constructor(results, hasMore, context) {
         super(results, hasMore, context);
     }
-    nextPage() { return this; }
+    nextPage() {
+        return this;
+    }
 }
 
 source.getHome = function () {
     return new OkHomePager([], false, {});
 };
-source.isChannelUrl = function () { return false; };
+
+function parseChannelUrl(url) {
+    url = safeStr(url);
+    let m = url.match(/ok\.ru\/profile\/(\d+)/i);
+    if (m) return { id: m[1], kind: "user", url: channelUrlFor(m[1], "user") };
+    m = url.match(/ok\.ru\/group\/(\d+)/i);
+    if (m) return { id: m[1], kind: "group", url: channelUrlFor(m[1], "group") };
+    m = url.match(/ok\.ru\/video\/c(\d+)/i);
+    if (m) return { id: m[1], kind: "album", url: channelUrlFor(m[1], "album") };
+    return null;
+}
+
+function channelCandidateUrls(info) {
+    let id = info.id;
+    let urls = [info.url];
+    if (info.kind === "user") {
+        urls.push("https://ok.ru/profile/" + id + "/video");
+        urls.push("https://ok.ru/profile/" + id);
+        urls.push("https://ok.ru/dk?st.cmd=userMovies&st.userId=" + id);
+    } else if (info.kind === "group") {
+        urls.push("https://ok.ru/group/" + id + "/video");
+        urls.push("https://ok.ru/group/" + id);
+        urls.push("https://ok.ru/video/c" + id);
+    } else {
+        urls.push("https://ok.ru/video/c" + id);
+        urls.push("https://ok.ru/group/" + id + "/video");
+        urls.push("https://ok.ru/profile/" + id + "/video");
+    }
+    let out = [];
+    for (let i = 0; i < urls.length; i++) {
+        if (urls[i] && out.indexOf(urls[i]) < 0) out.push(urls[i]);
+    }
+    return out;
+}
+
+function withPage(url, page) {
+    if (!page || page <= 1) return url;
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "st.page=" + page;
+}
+
+function extractOg(html, prop) {
+    let re = new RegExp("<meta[^>]+(?:property|name)=[\"']" + prop + "[\"'][^>]+content=[\"']([^\"']+)[\"']", "i");
+    let m = safeStr(html).match(re);
+    if (m) return cleanText(m[1]);
+    re = new RegExp("<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+(?:property|name)=[\"']" + prop + "[\"']", "i");
+    m = safeStr(html).match(re);
+    return m ? cleanText(m[1]) : "";
+}
+
+const CHANNEL_CACHE_TTL = 90000;
+let CHANNEL_CACHE = {};
+
+function channelCacheKey(id, kind, page, listUrl) {
+    return safeStr(kind) + ":" + safeStr(id) + ":" + (page || 1) + ":" + safeStr(listUrl);
+}
+
+function loadChannelPage(info, page, listUrl) {
+    let candidates = [];
+    if (listUrl) candidates.push(listUrl);
+    let more = channelCandidateUrls(info);
+    for (let i = 0; i < more.length; i++) {
+        if (candidates.indexOf(more[i]) < 0) candidates.push(more[i]);
+    }
+    let best = "";
+    let bestUrl = candidates[0] || info.url;
+    for (let i = 0; i < candidates.length; i++) {
+        let target = withPage(candidates[i], page);
+        let html = "";
+        try { html = httpGetAuthenticated(target); } catch (e) {
+            addDebug("channel auth: " + e);
+            if (page <= 1 && i === 0 && !listUrl) throw e;
+            continue;
+        }
+        if (!html) continue;
+        if (!best) {
+            best = html;
+            bestUrl = candidates[i];
+        }
+        if (looksLikeSearchResults(html)) {
+            addDebug("channel videos via " + target + " bytes=" + html.length);
+            return { html: html, url: candidates[i] };
+        }
+        addDebug("channel sin videos en " + target);
+        // En páginas siguientes no pruebes otros endpoints si ya hay uno elegido.
+        if (listUrl) break;
+    }
+    return { html: best, url: bestUrl };
+}
+
+function channelVideosFromHtml(html, info) {
+    let found = extractSearchResults(html);
+    let out = [];
+    let author = {
+        id: info.id,
+        name: info.name || "OK.ru",
+        kind: info.kind,
+        url: info.url,
+        avatar: info.avatar || ""
+    };
+    for (let i = 0; i < found.length; i++) {
+        if (!found[i].author || !found[i].author.id) found[i].author = author;
+        else if (!found[i].author.name || found[i].author.name === "OK.ru") found[i].author.name = author.name;
+        let v = makeSearchVideo(found[i]);
+        if (v) out.push(v);
+    }
+    return out;
+}
+
+function fetchChannel(url, page, listUrl) {
+    let info = parseChannelUrl(url);
+    if (!info) throw new Error("URL de canal OK.ru no válida");
+    page = Math.max(1, Number(page) || 1);
+    let cacheKey = channelCacheKey(info.id, info.kind, page, listUrl || "");
+    try {
+        let hit = CHANNEL_CACHE[cacheKey];
+        if (hit && nowMs() - hit.time < CHANNEL_CACHE_TTL) return hit.value;
+    } catch (_) {}
+    let loaded = loadChannelPage(info, page, listUrl);
+    let html = loaded.html || "";
+    if (!html) throw makeErr(LOGIN_MSG);
+    info.listUrl = loaded.url || info.url;
+
+    let name = extractOg(html, "og:title") || extractPageTitle(html) || info.name || "OK.ru";
+    name = cleanText(name)
+        .replace(/\s*[|\-–]\s*OK\.?RU.*$/i, "")
+        .replace(/\s+(?:videos?|фильмы|видео)\s*$/i, "")
+        .trim();
+    if (!name || isGenericSiteTitle(name)) name = info.name || "OK.ru";
+    info.name = name;
+    info.avatar = normalizeUrl(extractOg(html, "og:image"), "https://ok.ru/");
+    info.description = extractOg(html, "og:description");
+
+    let videos = channelVideosFromHtml(html, info);
+    let hasMore = videos.length >= 8;
+    let packed = { info: info, videos: videos, hasMore: hasMore, page: page };
+    try { CHANNEL_CACHE[cacheKey] = { time: nowMs(), value: packed }; } catch (_) {}
+    return packed;
+}
+
+class OkChannelPager extends VideoPager {
+    constructor(results, hasMore, context) {
+        super(results, hasMore, context);
+    }
+    nextPage() {
+        if (!this.hasMorePagers()) return this;
+        let ctx = this.context || {};
+        return source.getChannelContents(ctx.url, ctx.type, ctx.order, ctx.filters, ctx);
+    }
+}
+
+source.getChannelCapabilities = function () {
+    try {
+        return new ResultCapabilities(["video"], [], []);
+    } catch (_) {
+        return { types: ["video"], sorts: [], filters: [] };
+    }
+};
+
+source.isChannelUrl = function (url) {
+    return REGEX_CHANNEL_URL.test(safeStr(url));
+};
+
+source.getChannel = function (url) {
+    let packed = fetchChannel(url, 1, "");
+    let info = packed.info;
+    return new PlatformChannel({
+        id: new PlatformID(PLATFORM_NAME, info.kind + ":" + info.id, PLUGIN_ID),
+        name: info.name || "OK.ru",
+        thumbnail: isHttpUrl(info.avatar) ? info.avatar : "",
+        banner: "",
+        subscribers: 0,
+        description: info.description || "",
+        url: info.url,
+        links: {}
+    });
+};
+
+source.getChannelContents = function (url, type, order, filters, continuationToken) {
+    let page = 1;
+    let listUrl = "";
+    try {
+        if (continuationToken && typeof continuationToken === "object") {
+            page = Math.max(1, Number(continuationToken.page) || 1);
+            listUrl = safeStr(continuationToken.listUrl);
+            if (continuationToken.url) url = continuationToken.url;
+        } else if (continuationToken) {
+            page = Math.max(1, Number(continuationToken) || 1);
+        }
+    } catch (_) {}
+
+    let packed = fetchChannel(url, page, listUrl);
+    return new OkChannelPager(packed.videos, packed.hasMore, {
+        url: packed.info.url,
+        listUrl: packed.info.listUrl || "",
+        type: type,
+        order: order,
+        filters: filters,
+        page: page + 1
+    });
+};
