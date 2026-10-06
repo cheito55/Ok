@@ -1,5 +1,5 @@
 /*
- * GrayJay - OK.ru Source v38 (Cast + extractor estable)
+ * GrayJay - OK.ru Source v40 (Cast + canal clickeable + autores en español)
  *
  * Por qué PlayPelis “sí” y aquí a veces “no” (mismos links ok.ru):
  *   PlayPelis pide HTML + master HLS + segmentos en el MISMO proceso HTTP.
@@ -970,9 +970,83 @@ function extractAuthorFromBlock(block) {
     return out;
 }
 
+// ------------------------- Nombres de autor en español -------------------------
+// Traduce al español los nombres de autor/canal que vienen en alfabetos no
+// latinos (cirílico, etc.). Usa translate.googleapis.com (agregar a allowUrls
+// en OkRuConfig.json). Hay caché en memoria y la búsqueda traduce todos los
+// nombres de una página en UNA sola petición.
+const AUTHOR_ES_CACHE = {};
+
+function needsSpanishName(name) {
+    // Letras de alfabetos no latinos (cirílico, griego, árabe, CJK, etc.)
+    return /[\u0370-\u03FF\u0400-\u052F\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0EFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]/.test(safeStr(name));
+}
+
+function translateRaw(text) {
+    try {
+        let url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=es&dt=t&q=" + encodeURIComponent(text);
+        let r = http.GET(url, { "User-Agent": "Mozilla/5.0" });
+        let body = "";
+        try { body = r.body; } catch (_) {}
+        if (!body) { try { body = r.getBody(); } catch (_) {} }
+        let j = JSON.parse(safeStr(body));
+        let out = "";
+        if (j && j[0]) for (let i = 0; i < j[0].length; i++) out += safeStr(j[0][i] && j[0][i][0]);
+        return out;
+    } catch (e) {
+        addDebug("translateRaw: " + e);
+        return "";
+    }
+}
+
+function prefetchSpanishNames(names) {
+    let pending = [];
+    let seen = {};
+    for (let i = 0; i < names.length; i++) {
+        let n = cleanText(names[i]);
+        if (n && needsSpanishName(n) && !AUTHOR_ES_CACHE[n] && !seen[n]) {
+            seen[n] = true;
+            pending.push(n);
+        }
+    }
+    if (!pending.length) return;
+    pending = pending.slice(0, 40);
+
+    let joined = translateRaw(pending.join("\n"));
+    let parts = joined ? joined.split("\n") : [];
+    if (parts.length === pending.length) {
+        for (let i = 0; i < pending.length; i++) {
+            let t = cleanText(parts[i]);
+            AUTHOR_ES_CACHE[pending[i]] = t || pending[i];
+        }
+        return;
+    }
+    // Respaldo: de a uno (máx. 8) si el lote no volvió alineado.
+    for (let i = 0; i < pending.length && i < 8; i++) {
+        let t = cleanText(translateRaw(pending[i]));
+        AUTHOR_ES_CACHE[pending[i]] = t || pending[i];
+    }
+}
+
+function toSpanishName(name) {
+    name = cleanText(name);
+    if (!name || !needsSpanishName(name)) return name;
+    if (!AUTHOR_ES_CACHE[name]) prefetchSpanishNames([name]);
+    return AUTHOR_ES_CACHE[name] || name;
+}
+
+function prefetchResultAuthors(raw) {
+    let names = [];
+    for (let i = 0; i < raw.length; i++) {
+        let ai = raw[i] && raw[i].authorInfo;
+        if (ai && ai.name) names.push(ai.name);
+    }
+    prefetchSpanishNames(names);
+}
+
 function makeAuthorLink(info) {
     info = info || {};
-    let name = cleanText(info.name);
+    let name = toSpanishName(info.name);
     let url = isHttpUrl(info.url) ? info.url : "";
     let id = safeStr(info.id);
 
@@ -1909,6 +1983,8 @@ function searchOk(query, continuationToken) {
         }
     }
 
+    prefetchResultAuthors(raw);
+
     let out = [];
     for (let i = 0; i < raw.length; i++) {
         let v = makeSearchVideo(raw[i]);
@@ -2146,6 +2222,8 @@ function channelPager(url, page) {
         }
     }
 
+    prefetchResultAuthors(raw);
+
     let out = [];
     for (let i = 0; i < raw.length; i++) {
         let v = makeSearchVideo(raw[i]);
@@ -2177,8 +2255,8 @@ function getChannelObject(url) {
 
     try {
         return new PlatformChannel({
-            id: id || canonical,
-            name: name,
+            id: new PlatformID(PLATFORM_NAME, id || canonical, PLUGIN_ID),
+            name: toSpanishName(name),
             thumbnail: thumbnail,
             banner: "",
             subscribers: 0,
