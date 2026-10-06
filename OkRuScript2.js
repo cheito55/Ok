@@ -1944,6 +1944,65 @@ source.getHome = function () {
     return new OkHomePager([], false, {});
 };
 
+// 1. Reconocer URLs de canales de OK.ru
 source.isChannelUrl = function (url) {
-    return false;
+    return /ok\.ru\/(?:profile|group|video\/showcase)/i.test(url);
 };
+
+// 2. Cargar los datos básicos del canal
+source.getChannel = function (url) {
+    let id = "canal";
+    let m = url.match(/ok\.ru\/(?:profile|group|video\/showcase)\/([^/?]+)/i);
+    if (m) id = m[1];
+    
+    // Obtenemos el HTML del perfil para extraer el nombre real del canal
+    let html = httpGetAuthenticated(url);
+    let name = "Canal OK.ru";
+    
+    if (html) {
+        let titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        if (titleMatch) {
+            // Limpiamos el título para quitar " | OK.RU"
+            name = titleMatch[1].replace(/\s*\|.*$/i, "").trim();
+        }
+    }
+    
+    return new PlatformChannel({
+        id: new PlatformID(PLATFORM_NAME, id, PLUGIN_ID),
+        name: name,
+        thumbnail: "",
+        banner: "",
+        subscribers: 0,
+        description: "Videos publicados en OK.ru",
+        url: url
+    });
+};
+
+// 3. Extraer la lista de videos del canal
+source.getChannelContents = function (url) {
+    let videoUrl = url;
+    // Aseguramos que la URL apunte a la pestaña de videos del canal
+    if (videoUrl.indexOf("/video") === -1) {
+        if (videoUrl.charAt(videoUrl.length - 1) !== "/") videoUrl += "/";
+        videoUrl += "video";
+    }
+    
+    let html = httpGetAuthenticated(videoUrl);
+    if (!html) throw new Error("No se pudo cargar el canal de OK.ru");
+    
+    // Reutilizamos el extractor de búsqueda del script para leer la grilla de videos
+    let found = extractSearchResults(html);
+    let out = [];
+    let seen = {};
+    
+    for (let i = 0; i < found.length; i++) {
+        if (!seen[found[i].id]) {
+            seen[found[i].id] = true;
+            let v = makeSearchVideo(found[i]);
+            if (v) out.push(v);
+        }
+    }
+    
+    return new OkHomePager(out, false, {});
+};
+
