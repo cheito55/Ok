@@ -841,6 +841,47 @@ function getAuthorName(meta) {
 
     return "";
 }
+function getAuthorId(meta) {
+    let direct = firstValue(meta, ["authorId", "ownerId", "userId", "uploaderId"]);
+    if (direct) return direct;
+    
+    let containers = [meta.author, meta.owner, meta.user, meta.uploader];
+    for (let i = 0; i < containers.length; i++) {
+        if (safeObj(containers[i])) {
+            let id = firstValue(containers[i], ["id", "uid", "profileId", "groupId"]);
+            if (id) return id;
+        }
+    }
+    return "";
+}
+
+function getAuthorUrl(meta) {
+    let direct = firstValue(meta, ["authorUrl", "ownerUrl", "profileUrl", "profile"]);
+    if (direct) return direct;
+    
+    let containers = [meta.author, meta.owner, meta.user, meta.uploader];
+    for (let i = 0; i < containers.length; i++) {
+        if (safeObj(containers[i])) {
+            let url = firstValue(containers[i], ["url", "profile", "profileUrl", "link"]);
+            if (url) return url;
+        }
+    }
+    return "";
+}
+
+function getAuthorAvatar(meta) {
+    let direct = firstValue(meta, ["authorAvatar", "ownerAvatar", "avatar", "pic_1"]);
+    if (direct) return direct;
+    
+    let containers = [meta.author, meta.owner, meta.user, meta.uploader];
+    for (let i = 0; i < containers.length; i++) {
+        if (safeObj(containers[i])) {
+            let img = firstValue(containers[i], ["avatar", "pic", "pic_1", "pic_2", "photo", "imageUrl"]);
+            if (img) return img;
+        }
+    }
+    return "";
+}
 
 function getDescription(meta) {
     return cleanText(
@@ -1216,7 +1257,22 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     let title = getTitle(meta, fallbackTitle, extractVideoId(pageUrl));
     let poster = normalizeUrl(getPoster(meta), pageUrl);
     let duration = getDuration(meta);
-    let authorName = getAuthorName(meta) || "OK.ru";
+        let authorName = getAuthorName(meta) || "OK.ru";
+    let authorId = getAuthorId(meta);
+    let authorUrl = getAuthorUrl(meta);
+    let authorAvatar = getAuthorAvatar(meta);
+
+    if (authorUrl) {
+        authorUrl = normalizeUrl(authorUrl, "https://ok.ru/");
+    } else if (authorId) {
+        authorUrl = "https://ok.ru/profile/" + authorId;
+    } else {
+        authorUrl = "https://ok.ru/";
+    }
+    
+    if (authorAvatar) {
+        authorAvatar = normalizeUrl(authorAvatar, "https://ok.ru/");
+    }
 
     let hls = [];
     let xuperPlaylist = xuperResolve(meta);
@@ -1341,13 +1397,11 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
 
     let author = null;
     try {
-        // FIX: usar el nombre de autor/canal real cuando esté disponible
-        // en lugar de mostrar siempre "OK.ru" como autor.
         author = new PlatformAuthorLink(
-            new PlatformID(PLATFORM_NAME, "", PLUGIN_ID),
+            new PlatformID(PLATFORM_NAME, authorId || "", PLUGIN_ID),
             authorName,
-            "https://ok.ru/",
-            "",
+            authorUrl,
+            authorAvatar || "",
             0
         );
     } catch (_) {}
