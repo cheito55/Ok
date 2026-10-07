@@ -1,5 +1,5 @@
 /*
- * GrayJay - OK.ru Source v38 (Cast + extractor estable)
+ * GrayJay - OK.ru Source v41 (Cast + canal clickeable + autores en español, URLs de canal canónicas)
  *
  * Por qué PlayPelis “sí” y aquí a veces “no” (mismos links ok.ru):
  *   PlayPelis pide HTML + master HLS + segmentos en el MISMO proceso HTTP.
@@ -846,266 +846,236 @@ function getAuthorName(meta) {
 // author.id/uid y grupos para no perder el enlace cuando el video pertenece a
 // una comunidad.
 function getAuthorInfo(meta) {
-    let info = { name: "", id: "", url: "", thumbnail: "", subscribers: 0, kind: "" };
+    let info = { name: "", id: "", url: "", thumbnail: "", subscribers: 0 };
     if (!safeObj(meta)) return info;
 
-    // OK.ru no siempre usa el mismo nivel para el propietario del video.
-    // Probamos autor/owner/uploader/user/creator y también las variantes de
-    // grupo/comunidad, sin tocar el parser de reproducción.
-    let candidates = [
-        meta.author,
-        meta.owner,
-        meta.uploader,
-        meta.user,
-        meta.creator,
-        meta.profile,
-        meta.group,
-        meta.community
-    ];
+    let a = safeObj(meta.author) ? meta.author :
+            (safeObj(meta.owner) ? meta.owner :
+            (safeObj(meta.user) ? meta.user :
+            (safeObj(meta.uploader) ? meta.uploader : null)));
 
-    for (let i = 0; i < candidates.length; i++) {
-        let a = candidates[i];
-        if (!safeObj(a)) continue;
-
-        if (!info.name) {
-            info.name = cleanText(firstValue(a, [
-                "name", "displayName", "fullName", "userName", "username",
-                "nickName", "title", "groupName", "groupTitle", "communityName"
-            ]));
-        }
-
-        if (!info.id) {
-            info.id = safeStr(firstValue(a, [
-                "id", "userId", "uid", "profileId", "groupId", "groupID",
-                "group_id", "communityId", "communityID"
-            ]));
-        }
-
-        let profileValue = firstValue(a, [
-            "profileUrl", "profile", "url", "href", "webUrl", "link", "canonicalUrl"
-        ]);
-        if (!profileValue && safeObj(a.profile)) {
-            profileValue = firstValue(a.profile, ["url", "href", "profile", "link"]);
-        }
-        if (!info.url && profileValue) {
-            info.url = normalizeUrl(profileValue, "https://ok.ru/");
-        }
-
-        if (!info.thumbnail) {
-            info.thumbnail = normalizeUrl(firstValue(a, [
-                "thumbnail", "avatar", "avatarUrl", "photo", "photoUrl", "image", "imageUrl"
-            ]), "https://ok.ru/");
-        }
-
-        if (!info.subscribers) {
-            let sub = firstValue(a, [
-                "subscribers", "subscriberCount", "followers", "followersCount"
-            ]);
-            if (sub) info.subscribers = parseInt(sub, 10) || 0;
-        }
-
-        let kind = firstValue(a, ["type", "kind", "objectType", "entityType", "profileType"]);
-        if (kind) info.kind = cleanText(kind).toLowerCase();
+    if (a) {
+        info.name = cleanText(firstValue(a, ["name", "displayName", "fullName", "userName", "username", "nickName"]));
+        info.id = safeStr(firstValue(a, ["id", "userId", "uid", "profileId"]));
+        let profileValue = firstValue(a, ["profile", "profileUrl", "url", "href"]);
+        if (safeObj(profileValue)) profileValue = firstValue(profileValue, ["url", "href", "profile"]);
+        info.url = normalizeUrl(profileValue, "https://ok.ru/");
+        info.thumbnail = normalizeUrl(firstValue(a, ["thumbnail", "avatar", "avatarUrl", "photo", "photoUrl"]), "https://ok.ru/");
+        let sub = firstValue(a, ["subscribers", "subscriberCount", "followers", "followersCount"]);
+        if (sub) info.subscribers = parseInt(sub, 10) || 0;
     }
 
-    // Campos planos frecuentes en metadata de OK.ru.
     if (!info.name) info.name = getAuthorName(meta);
-    if (!info.id) {
-        info.id = safeStr(firstValue(meta, [
-            "authorId", "ownerId", "uploaderId", "userId", "profileId",
-            "author_id", "owner_id", "uploader_id"
-        ]));
-    }
-    if (!info.url) {
-        info.url = normalizeUrl(firstValue(meta, [
-            "authorUrl", "ownerUrl", "uploaderUrl", "profileUrl", "authorProfile"
-        ]), "https://ok.ru/");
-    }
 
-    // Si hay una identidad de grupo/comunidad explícita, esa ruta tiene
-    // prioridad sobre /profile/<id>. Esto hace que el click abra el canal real.
-    let groupId = safeStr(firstValue(meta, [
-        "groupId", "groupID", "group_id", "communityId", "communityID"
-    ]));
-    let groupName = cleanText(firstValue(meta, [
-        "groupName", "groupTitle", "communityName", "communityTitle"
-    ]));
-
+    // Si el video es de un grupo/comunidad, groupId suele ser más fiable que
+    // inventar un /profile/<id>.
     let movie = safeObj(meta.movie) ? meta.movie : null;
-    if (movie) {
-        if (!groupId) groupId = safeStr(firstValue(movie, ["groupId", "groupID", "group_id", "communityId"]));
-        if (!groupName) groupName = cleanText(firstValue(movie, ["groupName", "groupTitle", "communityName"]));
+    let groupId = movie ? firstValue(movie, ["groupId", "groupID", "group_id"]) : "";
+    if (groupId && (!info.url || /\/profile\//i.test(info.url) === false && /\/group\//i.test(info.url) === false)) {
+        // Conservamos el autor individual si ya vino explícitamente.
     }
 
-    if (groupId && (!info.url || /\/profile\//i.test(info.url))) {
-        info.id = groupId;
-        info.url = "https://ok.ru/group/" + encodeURIComponent(groupId) + "/video/all";
-        info.kind = "group";
-        if (groupName) info.name = groupName;
-    }
-
-    // Inferimos el tipo desde la URL cuando OK.ru sí la entregó.
-    if (info.url) {
-        if (/\/group\//i.test(info.url)) info.kind = "group";
-        else if (/\/profile\//i.test(info.url)) info.kind = "profile";
-    }
-
-    // Con ID + tipo conocido podemos construir una URL navegable.
-    if (!info.url && info.id) {
-        if (/group|community/i.test(info.kind)) {
-            info.url = "https://ok.ru/group/" + encodeURIComponent(info.id) + "/video/all";
-        } else {
-            info.url = "https://ok.ru/profile/" + encodeURIComponent(info.id) + "/video";
+    if (!info.url && groupId) {
+        info.id = safeStr(groupId);
+        info.url = "https://ok.ru/group/" + encodeURIComponent(safeStr(groupId)) + "/";
+        if (!info.name) {
+            info.name = cleanText(firstValue(meta, ["groupName", "groupTitle", "communityName"]));
         }
     }
 
+    // Si solo tenemos el ID del usuario, construir el perfil estándar.
+    if (!info.url && info.id) {
+        info.url = "https://ok.ru/profile/" + encodeURIComponent(info.id);
+    }
+
+    // Evitar enlaces basura como ok.ru/ o strings no-URL.
     if (!isHttpUrl(info.url) || /^https?:\/\/ok\.ru\/?$/i.test(info.url)) info.url = "";
     return info;
 }
 
-// Extrae autor/canal de una tarjeta o de un bloque JSON de búsqueda.
-// No depende de una posición fija del objeto author: OK.ru puede insertar
-// objetos anidados y cambiar el orden de sus campos.
+// Busca la identidad del autor dentro del bloque HTML de resultados. Esto
+// permite mostrar el nombre y hacer click en él SIN descargar los detalles
+// completos de cada video de la búsqueda.
 function extractAuthorFromBlock(block) {
     block = safeStr(block);
-    let out = { name: "", id: "", url: "", thumbnail: "", subscribers: 0, kind: "" };
+    let out = { name: "", id: "", url: "", thumbnail: "", subscribers: 0 };
     if (!block) return out;
 
+    // OK.ru mezcla HTML, JSON escapado y entidades HTML en los resultados.
+    // Normalizamos las tres variantes antes de buscar la identidad.
     let src = block;
     try { src = htmlDecode(src); } catch (_) {}
-    src = src.replace(/\\(["'])/g, "$1").replace(/\\\//g, "/");
+    src = src.replace(/\\(["'])/g, "$1");
 
-    function firstMatch(reList) {
-        for (let i = 0; i < reList.length; i++) {
-            let m = src.match(reList[i]);
-            if (m && m[1]) return cleanText(m[1]);
-        }
-        return "";
-    }
+    // 1) Objeto author / owner / uploader en JSON.
+    let m = src.match(/(?:["']?(?:author|owner|uploader|creator)["']?\s*:\s*)\{([\s\S]{0,6000})\}/i);
+    let obj = m ? m[1] : src;
 
-    // 1) URL explícita: es la fuente más fiable para distinguir perfil/grupo.
-    let links = src.match(/(?:https?:)?\\?\/\\?\/(?:www\.|m\.)?ok\.ru\\?\/(?:profile|group)\\?\/[^\s"'<>\\]+/ig) || [];
+    let nm = obj.match(/(?:["']?(?:name|displayName|fullName|userName|username|nickName)["']?)\s*:\s*["']([^"']{2,300})["']/i);
+    if (nm) out.name = cleanText(nm[1]);
+
+    let im = obj.match(/(?:["']?(?:id|userId|uid|profileId|user_id)["']?)\s*:\s*["']?([A-Za-z0-9_-]{3,80})["']?/i);
+    if (im) out.id = cleanText(im[1]);
+
+    let um = obj.match(/(?:["']?(?:profile|profileUrl|url|href)["']?)\s*:\s*["']([^"']{5,1000})["']/i);
+    if (um) out.url = normalizeUrl(um[1], "https://ok.ru/");
+
+    let tm = obj.match(/(?:["']?(?:thumbnail|avatar|avatarUrl|photo|photoUrl)["']?)\s*:\s*["']([^"']{5,1000})["']/i);
+    if (tm) out.thumbnail = normalizeUrl(tm[1], "https://ok.ru/");
+
+    let sm = obj.match(/(?:["']?(?:subscribers|subscriberCount|followers|followersCount)["']?)\s*:\s*["']?(\d+)/i);
+    if (sm) out.subscribers = parseInt(sm[1], 10) || 0;
+
+    // 2) Enlace explícito al perfil/grupo, incluso si el objeto author no existe.
+    let links = src.match(/(?:https?:\\?\/\\?\/|\\?\/)?(?:www\.|m\.)?ok\.ru\\?\/(?:profile|group)\\?\/[^\s"'<>\\]+/ig) || [];
     for (let i = 0; i < links.length; i++) {
         let u = normalizeUrl(links[i].replace(/\\\//g, "/"), "https://ok.ru/");
         if (/\/profile\//i.test(u) || /\/group\//i.test(u)) {
             out.url = u;
-            let um = u.match(/\/(profile|group)\/([^/?#]+)/i);
-            if (um) {
-                out.kind = um[1].toLowerCase();
-                out.id = safeStr(um[2]);
-            }
+            let pm = u.match(/\/(?:profile|group)\/([^/?#]+)/i);
+            if (pm) out.id = safeStr(pm[1]);
             break;
         }
     }
 
-    // 2) data-* de las tarjetas HTML.
-    out.name = firstMatch([
-        /(?:data-author-name|data-owner-name|data-uploader-name|data-creator-name|data-group-name|data-community-name)\s*=\s*["']([^"']{2,300})["']/i,
-        /(?:data-author|data-owner|data-uploader)\s*=\s*["']([^"']{2,300})["']/i
-    ]);
-
-    if (!out.id) {
-        out.id = firstMatch([
-            /(?:data-author-id|data-owner-id|data-uploader-id|data-user-id|data-profile-id)\s*=\s*["']?([A-Za-z0-9_.:-]{3,120})/i,
-            /(?:data-group-id|data-community-id)\s*=\s*["']?([A-Za-z0-9_.:-]{3,120})/i
-        ]);
+    // 3) data-* y clases HTML usadas por las tarjetas.
+    if (!out.name) {
+        m = src.match(/(?:data-author-name|data-owner-name|data-uploader-name|data-creator-name)\s*=\s*["']([^"']{2,300})["']/i);
+        if (m) out.name = cleanText(m[1]);
+    }
+    if (!out.name) {
+        m = src.match(/class=["'][^"']*(?:ucard_name|ucard-name|author-name|authorName|owner-name|entity-name)[^"']*["'][^>]*>([\s\S]{1,500}?)<\//i);
+        if (m) out.name = cleanText(m[1]);
     }
 
-    // 3) Buscar pares clave/valor en una ventana amplia. Evitamos el antiguo
-    // patrón \{...\} que se rompía en cuanto aparecía un objeto anidado.
-    let namePatterns = [
-        /["'](?:author|owner|uploader|creator)["']\s*:\s*\{[\s\S]{0,9000}?["'](?:name|displayName|fullName|userName|username|nickName)["']\s*:\s*["']([^"']{2,300})["']/i,
-        /["'](?:authorName|ownerName|uploaderName|creatorName)["']\s*:\s*["']([^"']{2,300})["']/i,
-        /["'](?:groupName|groupTitle|communityName|communityTitle)["']\s*:\s*["']([^"']{2,300})["']/i
-    ];
-    if (!out.name) out.name = firstMatch(namePatterns);
-
-    if (!out.id) {
-        out.id = firstMatch([
-            /["'](?:author|owner|uploader|creator)["']\s*:\s*\{[\s\S]{0,9000}?["'](?:id|userId|uid|profileId)["']\s*:\s*["']?([A-Za-z0-9_.:-]{3,120})/i,
-            /["'](?:authorId|ownerId|uploaderId|creatorId|userId|profileId)["']\s*:\s*["']?([A-Za-z0-9_.:-]{3,120})/i
-        ]);
-    }
-
-    if (!out.url) {
-        let u = firstMatch([
-            /["'](?:profileUrl|authorUrl|ownerUrl|uploaderUrl|profile|href|canonicalUrl)["']\s*:\s*["']([^"']{5,1000})["']/i,
-            /["'](?:url|link|webUrl)["']\s*:\s*["']([^"']{5,1000})["']/i
-        ]);
-        if (u) out.url = normalizeUrl(u, "https://ok.ru/");
-    }
-
-    if (!out.thumbnail) {
-        let t = firstMatch([
-            /["'](?:thumbnail|avatar|avatarUrl|photo|photoUrl|image|imageUrl)["']\s*:\s*["']([^"']{5,1200})["']/i
-        ]);
-        if (t) out.thumbnail = normalizeUrl(t, "https://ok.ru/");
-    }
-
-    let sm = src.match(/["'](?:subscribers|subscriberCount|followers|followersCount)["']\s*:\s*["']?(\d+)/i);
-    if (sm) out.subscribers = parseInt(sm[1], 10) || 0;
-
-    // 4) Grupo/comunidad: si existe, nunca convertir su ID en /profile/.
-    let gm = src.match(/["'](?:groupId|groupID|group_id|communityId|communityID|community_id)["']\s*:\s*["']?([A-Za-z0-9_.:-]{3,120})/i);
+    // 4) Identidad de comunidad/grupo. Para estos videos el canal correcto
+    // es /group/<id>/video/all, NO /profile/<id>.
+    let gm = src.match(/(?:["']?(?:groupId|groupID|group_id|group\.id)["']?)\s*:\s*["']?([A-Za-z0-9_-]{3,80})["']?/i);
     if (gm) {
         let gid = cleanText(gm[1]);
-        let gn = firstMatch([
-            /["'](?:groupName|groupTitle|communityName|communityTitle)["']\s*:\s*["']([^"']{2,300})["']/i
-        ]);
-        out.id = gid;
-        out.kind = "group";
-        out.url = "https://ok.ru/group/" + encodeURIComponent(gid) + "/video/all";
-        if (gn) out.name = gn;
+        let gname = "";
+        let gn = src.match(/(?:["']?(?:groupName|groupTitle|communityName|communityTitle)["']?)\s*:\s*["']([^"']{2,300})["']/i);
+        if (gn) gname = cleanText(gn[1]);
+        if (!/\/profile\//i.test(out.url)) {
+            out.id = gid;
+            out.url = "https://ok.ru/group/" + encodeURIComponent(gid) + "/video/all";
+            if (gname) out.name = gname;
+        }
     }
 
-    if (out.url) {
-        if (/\/group\//i.test(out.url)) out.kind = "group";
-        else if (/\/profile\//i.test(out.url)) out.kind = "profile";
-    }
-
-    if (out.id && !out.url) {
-        out.url = /group|community/i.test(out.kind)
-            ? "https://ok.ru/group/" + encodeURIComponent(out.id) + "/video/all"
-            : "https://ok.ru/profile/" + encodeURIComponent(out.id) + "/video";
-    }
-
-    // 5) Nombre visible de una tarjeta de autor. Solo se usa si ya tenemos
-    // una URL/ID de autor para no convertir el título del video en autor.
-    if (!out.name && (out.url || out.id)) {
-        let cm = src.match(/class=["'][^"']*(?:ucard_name|ucard-name|author-name|authorName|owner-name|entity-name)[^"']*["'][^>]*>([\s\S]{1,500}?)<\//i);
-        if (cm) out.name = cleanText(cm[1]);
-    }
+    // Si el ID es de perfil y todavía no hay URL, construir la ruta de videos.
+    if (out.id && !out.url) out.url = "https://ok.ru/profile/" + encodeURIComponent(out.id) + "/video";
 
     if (!isHttpUrl(out.url) || /^https?:\/\/ok\.ru\/?$/i.test(out.url)) out.url = "";
     return out;
 }
 
+// ------------------------- Nombres de autor en español -------------------------
+// Traduce al español los nombres de autor/canal que vienen en alfabetos no
+// latinos (cirílico, etc.). Usa translate.googleapis.com (agregar a allowUrls
+// en OkRuConfig.json). Hay caché en memoria y la búsqueda traduce todos los
+// nombres de una página en UNA sola petición.
+const AUTHOR_ES_CACHE = {};
+
+function needsSpanishName(name) {
+    // Letras de alfabetos no latinos (cirílico, griego, árabe, CJK, etc.)
+    return /[\u0370-\u03FF\u0400-\u052F\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0EFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]/.test(safeStr(name));
+}
+
+function translateRaw(text) {
+    try {
+        let url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=es&dt=t&q=" + encodeURIComponent(text);
+        let r = http.GET(url, { "User-Agent": "Mozilla/5.0" });
+        let body = "";
+        try { body = r.body; } catch (_) {}
+        if (!body) { try { body = r.getBody(); } catch (_) {} }
+        let j = JSON.parse(safeStr(body));
+        let out = "";
+        if (j && j[0]) for (let i = 0; i < j[0].length; i++) out += safeStr(j[0][i] && j[0][i][0]);
+        return out;
+    } catch (e) {
+        addDebug("translateRaw: " + e);
+        return "";
+    }
+}
+
+function prefetchSpanishNames(names) {
+    let pending = [];
+    let seen = {};
+    for (let i = 0; i < names.length; i++) {
+        let n = cleanText(names[i]);
+        if (n && needsSpanishName(n) && !AUTHOR_ES_CACHE[n] && !seen[n]) {
+            seen[n] = true;
+            pending.push(n);
+        }
+    }
+    if (!pending.length) return;
+    pending = pending.slice(0, 40);
+
+    let joined = translateRaw(pending.join("\n"));
+    let parts = joined ? joined.split("\n") : [];
+    if (parts.length === pending.length) {
+        for (let i = 0; i < pending.length; i++) {
+            let t = cleanText(parts[i]);
+            AUTHOR_ES_CACHE[pending[i]] = t || pending[i];
+        }
+        return;
+    }
+    // Respaldo: de a uno (máx. 8) si el lote no volvió alineado.
+    for (let i = 0; i < pending.length && i < 8; i++) {
+        let t = cleanText(translateRaw(pending[i]));
+        AUTHOR_ES_CACHE[pending[i]] = t || pending[i];
+    }
+}
+
+function toSpanishName(name) {
+    name = cleanText(name);
+    if (!name || !needsSpanishName(name)) return name;
+    if (!AUTHOR_ES_CACHE[name]) prefetchSpanishNames([name]);
+    return AUTHOR_ES_CACHE[name] || name;
+}
+
+function prefetchResultAuthors(raw) {
+    let names = [];
+    for (let i = 0; i < raw.length; i++) {
+        let ai = raw[i] && raw[i].authorInfo;
+        if (ai && ai.name) names.push(ai.name);
+    }
+    prefetchSpanishNames(names);
+}
+
+// URL "canónica" del autor/canal: igual que en la versión que abría el canal
+// (OkRuScript3): https://ok.ru/profile/<id> o https://ok.ru/group/<id>, SIN
+// /video ni /video/all. El sufijo se agrega solo al descargar la página
+// (normalizeChannelUrl), así el enlace del autor, isChannelUrl y
+// PlatformChannel.url coinciden siempre.
+function bareChannelUrl(url) {
+    let u = safeStr(url).trim();
+    let m = u.match(/^(?:https?:\/\/)?(?:www\.|m\.)?ok\.ru\/(profile|group)\/([^\/?#]+)/i);
+    if (!m) return u;
+    return "https://ok.ru/" + m[1].toLowerCase() + "/" + m[2];
+}
+
 function makeAuthorLink(info) {
     info = info || {};
-    let name = cleanText(info.name);
+    let name = toSpanishName(info.name);
     let url = isHttpUrl(info.url) ? info.url : "";
     let id = safeStr(info.id);
-    let kind = cleanText(info.kind).toLowerCase();
 
     if (!id && url) {
         let m = url.match(/\/(?:profile|group)\/([^/?#]+)/i);
         if (m) id = m[1];
     }
 
-    if (!kind && url) {
-        if (/\/group\//i.test(url)) kind = "group";
-        else if (/\/profile\//i.test(url)) kind = "profile";
-    }
-
+    // Cuando OK.ru entrega nombre + ID pero no profile URL, el ID permite
+    // crear un enlace real al perfil/videos. Esto evita que GrayJay muestre
+    // "Unknown" por recibir author=null.
     if (!url && id) {
-        if (/group|community/i.test(kind)) {
-            url = "https://ok.ru/group/" + encodeURIComponent(id) + "/video/all";
-        } else {
-            url = "https://ok.ru/profile/" + encodeURIComponent(id) + "/video";
-        }
+        url = "https://ok.ru/profile/" + encodeURIComponent(id) + "/video";
     }
 
     if (!name || !url) return null;
+    url = bareChannelUrl(url);
     if (!id) id = name;
 
     try {
@@ -1818,9 +1788,11 @@ function extractAuthorForVideoInHtml(html, videoId) {
     let fallback = { name: "", id: "", url: "", thumbnail: "", subscribers: 0 };
     let m;
     let tries = 0;
-    while ((m = re.exec(html)) !== null && tries++ < 12) {
-        let start = Math.max(0, m.index - 12000);
-        let end = Math.min(html.length, m.index + 12000);
+    while ((m = re.exec(html)) !== null && tries++ < 4) {
+        // Ventana suficiente para JSON de la tarjeta, sin recorrer bloques
+        // enormes para cada resultado.
+        let start = Math.max(0, m.index - 3000);
+        let end = Math.min(html.length, m.index + 3000);
         let info = extractAuthorFromBlock(html.substring(start, end));
         if (info.name && info.url) return info;
         if (!fallback.name && info.name) fallback = info;
@@ -1845,26 +1817,31 @@ function resolveAuthorFromVideoSearch(id) {
 }
 
 function enrichSearchAuthors(results, html) {
-    // Primero intentamos resolverlo en el propio HTML de búsqueda.
-    for (let i = 0; i < results.length && i < 48; i++) {
-        let ai = results[i].authorInfo || {};
-        if (ai.name && ai.url) continue;
-        let info = extractAuthorForVideoInHtml(html, results[i].id);
-        if (info && (info.name || info.url || info.id)) results[i].authorInfo = info;
-    }
+    /*
+     * IMPORTANTE: esta función se ejecuta dentro de search().
+     * No hacemos peticiones /video/<id> aquí. Cada una es una petición
+     * autenticada adicional y, al hacerlas en serie, la búsqueda puede quedar
+     * bloqueada durante decenas de segundos.
+     *
+     * El autor se obtiene únicamente del HTML que ya descargó la búsqueda.
+     * Si el HTML no trae la identidad, se deja para getContentDetails(), donde
+     * ya existe la ruta normal de detalles y no se bloquea la lista de
+     * resultados.
+     */
+    html = safeStr(html);
+    if (!html || !results || !results.length) return results;
 
-    // Si OK.ru no incluye la identidad en la página de búsqueda, consultamos
-    // la página individual del video. Limitamos a los primeros 20 para que la
-    // búsqueda siga siendo razonablemente rápida y, sobre todo, para que las
-    // tarjetas visibles tengan autor real y clickeable.
-    let detailCalls = 0;
-    for (let i = 0; i < results.length && detailCalls < 20; i++) {
-        let ai = results[i].authorInfo || {};
+    // Solo enriquecemos los primeros resultados visibles. El resto conserva
+    // el authorInfo que haya podido obtener addSearchCandidate().
+    for (let i = 0; i < results.length && i < 24; i++) {
+        let r = results[i];
+        let ai = r.authorInfo || {};
         if (ai.name && ai.url) continue;
-        if (!/^\d+$/.test(safeStr(results[i].id))) continue;
-        let info = resolveAuthorFromVideoSearch(results[i].id);
-        detailCalls++;
-        if (info && (info.name || info.url || info.id)) results[i].authorInfo = info;
+
+        let info = extractAuthorForVideoInHtml(html, r.id);
+        if (info && (info.name || info.url || info.id)) {
+            r.authorInfo = info;
+        }
     }
     return results;
 }
@@ -2018,6 +1995,8 @@ function searchOk(query, continuationToken) {
             raw.push(found[i]);
         }
     }
+
+    prefetchResultAuthors(raw);
 
     let out = [];
     for (let i = 0; i < raw.length; i++) {
@@ -2256,6 +2235,8 @@ function channelPager(url, page) {
         }
     }
 
+    prefetchResultAuthors(raw);
+
     let out = [];
     for (let i = 0; i < raw.length; i++) {
         let v = makeSearchVideo(raw[i]);
@@ -2287,13 +2268,13 @@ function getChannelObject(url) {
 
     try {
         return new PlatformChannel({
-            id: id || canonical,
-            name: name,
+            id: new PlatformID(PLATFORM_NAME, id || canonical, PLUGIN_ID),
+            name: toSpanishName(name),
             thumbnail: thumbnail,
             banner: "",
             subscribers: 0,
             description: description,
-            url: canonical,
+            url: bareChannelUrl(canonical),
             links: {}
         });
     } catch (e) {
