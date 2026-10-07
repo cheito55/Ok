@@ -1,8 +1,13 @@
 /*
- * GrayJay - OK.ru Source v38 + canales (liviano)
+ * GrayJay - OK.ru Source v39 + canal = grupo de la ficha
  *
  * Base: OkRuScript_conLogin-Cast.js (v38). Agregado: nombre real del autor en
  * tarjetas y videos + clic en el nombre -> canal con sus videos. Sin traducción.
+ *
+ * v39: la ficha web muestra el grupo (ej. "Cine de antes"), no al usuario que
+ * subió el video (ej. "LORENZO J"). Si hay groupId o enlace /group/, ese es
+ * el canal. En la búsqueda, si la tarjeta solo trae al usuario, se lee la
+ * ficha pública del video (tope corto) y se reemplaza por el grupo.
  *
  * Por qué PlayPelis “sí” y aquí a veces “no” (mismos links ok.ru):
  *   PlayPelis pide HTML + master HLS + segmentos en el MISMO proceso HTTP.
@@ -1586,6 +1591,7 @@ function extractSearchResults(html) {
     }
 
     enrichSearchAuthors(results, html);
+    enrichAuthorsFromWatchPage(results);
     return results;
 }
 
@@ -1986,14 +1992,16 @@ function getAuthorInfo(meta) {
 
     if (!info.name) info.name = getAuthorName(meta);
 
-    // Video de una comunidad: groupId es más fiable que inventar /profile/<id>.
-    let movie = safeObj(meta.movie) ? meta.movie : null;
-    let groupId = movie ? safeStr(firstValue(movie, ["groupId", "groupID", "group_id"])) : "";
-    if (!/^\d{4,}$/.test(groupId)) groupId = "";
-    if (!info.url && groupId) {
-        info.id = groupId;
-        info.url = "https://ok.ru/group/" + encodeURIComponent(groupId) + "/";
-        if (!info.name) info.name = cleanText(firstValue(meta, ["groupName", "groupTitle", "communityName"]));
+    // La ficha web muestra el grupo, no al usuario que lo publicó.
+    let group = groupFromMeta(meta);
+    if (group.id || group.url) {
+        info.id = group.id || info.id;
+        info.url = group.url || info.url;
+        if (group.name && !isJunkName(group.name)) info.name = group.name;
+        else if (isGroupUrl(info.url)) info.name = "";
+        if (group.thumbnail) info.thumbnail = group.thumbnail;
+        info.explicit = true;
+        info.fromGroup = true;
     }
     if (!info.url && info.id) info.url = "https://ok.ru/profile/" + encodeURIComponent(info.id);
 
@@ -2175,6 +2183,15 @@ function extractAuthorFromBlock(block, strict) {
     }
     if (out.id && !out.url) out.url = "https://ok.ru/profile/" + encodeURIComponent(out.id) + "/video";
 
+    // Misma regla que la ficha: si el bloque trae un grupo, ese es el canal.
+    let gcard = groupCardFromBlock(src);
+    if (gcard && (gcard.url || gcard.id)) {
+        out.url = gcard.url || out.url;
+        out.id = gcard.id || out.id;
+        if (gcard.name && !isJunkName(gcard.name)) out.name = gcard.name;
+        out.fromGroup = true;
+    }
+
     if (!isHttpUrl(out.url) || /^https?:\/\/ok\.ru\/?$/i.test(out.url)) out.url = "";
     if (out.url && !isChannelLikeUrl(out.url)) out.url = "";
     return out;
@@ -2204,9 +2221,186 @@ function enrichSearchAuthors(results, html) {
     for (let i = 0; i < results.length && i < 24; i++) {
         let r = results[i];
         let ai = r.authorInfo || {};
-        if (ai.name && ai.url) continue;
+        if (ai.fromGroup && ai.name && ai.url) continue;
+        if (ai.name && ai.url && isGroupUrl(ai.url)) continue;
         let info = extractAuthorForVideoInHtml(html, r.id);
-        if (info && (info.name || info.url || info.id)) r.authorInfo = info;
+        if (info && (info.fromGroup || isGroupUrl(info.url))) r.authorInfo = info;
+        else if (info && (info.name || info.url || info.id) && !(ai.name && ai.url)) r.authorInfo = info;
+    }
+    return results;
+}
+
+// Tope: leer la ficha (como la web) solo en las primeras tarjetas que todavía
+// muestran un usuario o no tienen canal. Así "LORENZO J" pasa a "Cine de antes"
+// sin pedir una página por cada resultado del scroll.
+const WATCH_AUTHOR_CAP = 6;
+let WATCH_AUTHOR_CACHE = {};
+
+function isGroupUrl(url) {
+    return /ok\.ru\/group\/[^/?#]+/i.test(safeStr(url));
+}
+
+function groupFromMeta(meta) {
+    let out = emptyAuthor();
+    if (!safeObj(meta)) return out;
+    let movie = safeObj(meta.movie) ? meta.movie : {};
+    let containers = [movie, meta, safeObj(meta.group) ? meta.group : null, safeObj(meta.album) ? meta.album : null];
+    let groupId = "";
+    let groupName = "";
+    let thumb = "";
+    for (let i = 0; i < containers.length; i++) {
+        let c = containers[i];
+        if (!c) continue;
+        if (!groupId) {
+            let id = safeStr(firstValue(c, ["groupId", "groupID", "group_id"]));
+            if (/^\d{4,}$/.test(id)) groupId = id;
+        }
+        if (!groupName) {
+            let n = cleanText(firstValue(c, ["groupName", "groupTitle", "communityName", "communityTitle"]));
+            if (n && !isJunkName(n)) groupName = n;
+        }
+        if (!thumb) {
+            thumb = normalizeUrl(firstValue(c, ["groupAvatar", "groupPhoto", "avatarUrl", "pic190x190"]), "https://ok.ru/");
+        }
+    }
+    if (!groupId && isGroupUrl(firstValue(meta, ["groupUrl", "communityUrl"]))) {
+        let m = safeStr(firstValue(meta, ["groupUrl", "communityUrl"])).match(/\/group\/([^/?#]+)/i);
+        if (m) groupId = m[1];
+    }
+    if (!groupId) return out;
+    out.id = groupId;
+    out.url = "https://ok.ru/group/" + encodeURIComponent(groupId) + "/video/all";
+    out.name = groupName;
+    out.thumbnail = validImageUrl(thumb) ? thumb : "";
+    out.fromGroup = true;
+    out.explicit = true;
+    return out;
+}
+
+function groupCardFromBlock(src) {
+    src = safeStr(src);
+    if (!src) return null;
+    let out = emptyAuthor();
+    let gm = src.match(/(?:["']?(?:groupId|groupID|group_id)["']?)\s*[:=]\s*["']?(\d{4,})["']?/i);
+    if (gm) out.id = gm[1];
+    let gn = src.match(/(?:["']?(?:groupName|groupTitle|communityName|communityTitle)["']?)\s*[:=]\s*["']([^"']{2,300})["']/i);
+    if (gn) {
+        let n = cleanText(gn[1]);
+        if (!isJunkName(n)) out.name = n;
+    }
+    let linkRe = /(?:href\s*=\s*["']|["'])((?:https?:\/\/(?:www\.|m\.)?ok\.ru)?\/group\/(\d{4,})[^"'\s)]*)/gi;
+    let m, best = null;
+    while ((m = linkRe.exec(src)) !== null) {
+        best = m;
+        break;
+    }
+    if (best) {
+        out.id = best[2];
+        out.url = "https://ok.ru/group/" + encodeURIComponent(best[2]) + "/video/all";
+        if (!out.name) {
+            let after = src.substring(best.index, Math.min(src.length, best.index + 700));
+            let am = after.match(/>([^<]{2,300})<\/a>/i);
+            if (am) {
+                let an = cleanText(am[1]);
+                if (!isJunkName(an)) out.name = an;
+            }
+        }
+    }
+    if (out.id && !out.url) out.url = "https://ok.ru/group/" + encodeURIComponent(out.id) + "/video/all";
+    if (!out.id && !out.url) return null;
+    out.fromGroup = true;
+    return out;
+}
+
+function nameNearGroup(html, groupId) {
+    if (!groupId) return "";
+    let src = "";
+    try { src = htmlDecode(safeStr(html)).replace(/\\\//g, "/"); } catch (_) { src = safeStr(html); }
+    let esc = safeStr(groupId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    let re = new RegExp("href=[\"'][^\"']*/group/" + esc + "[^\"']*[\"'][^>]*>([^<]{2,300})<", "i");
+    let m = src.match(re);
+    if (m) {
+        let n = cleanText(m[1]);
+        if (n && !isJunkName(n)) return n;
+    }
+    re = new RegExp(">([^<]{2,300})<\\/a>[\\s\\S]{0,240}href=[\"'][^\"']*/group/" + esc, "i");
+    m = src.match(re);
+    if (m) {
+        let n2 = cleanText(m[1]);
+        if (n2 && !isJunkName(n2)) return n2;
+    }
+    return "";
+}
+
+function authorFromWatchHtml(html, videoId) {
+    let out = emptyAuthor();
+    html = safeStr(html);
+    if (!html) return out;
+    let meta = null;
+    try { meta = extractMetadataFromHtml(html); } catch (_) {}
+    if (meta) out = groupFromMeta(meta);
+    if (!out.url) {
+        let card = groupCardFromBlock(html);
+        if (card) out = card;
+    }
+    if (out.id && !out.name) out.name = nameNearGroup(html, out.id);
+    if (out.url && out.name) {
+        out.fromGroup = true;
+        out.explicit = true;
+        return out;
+    }
+    // Sin grupo: la ficha muestra el perfil. No conservar un usuario de la tarjeta.
+    let page = emptyAuthor();
+    try { page = extractAuthorFromVideoPage(html, videoId, [out.name]); } catch (_) {}
+    if (!out.url && page.url && !isGroupUrl(page.url)) {
+        out = page;
+        out.explicit = true;
+    } else if (out.url && page.name && !out.name && isGroupUrl(page.url)) {
+        out.name = page.name;
+    }
+    if (out.url) out.explicit = true;
+    return out;
+}
+
+function fetchWatchAuthor(videoId) {
+    videoId = safeStr(videoId);
+    if (!/^\d{6,}$/.test(videoId)) return emptyAuthor();
+    if (WATCH_AUTHOR_CACHE[videoId]) return WATCH_AUTHOR_CACHE[videoId];
+    let headers = { "Referer": "https://ok.ru/", "User-Agent": UA_DESKTOP };
+    let html = "";
+    try { html = httpGet("https://ok.ru/videoembed/" + videoId, headers); } catch (_) {}
+    let info = authorFromWatchHtml(html, videoId);
+    if (!info.name || !isGroupUrl(info.url)) {
+        let page = "";
+        try { page = httpGet("https://ok.ru/video/" + videoId, headers); } catch (_) {}
+        if (!page) {
+            try { page = httpGetAuthenticated("https://ok.ru/video/" + videoId); } catch (_) {}
+        }
+        let info2 = authorFromWatchHtml(page, videoId);
+        if (isGroupUrl(info2.url) && info2.name) info = info2;
+        else if (!info.name && info2.name) info = info2;
+    }
+    WATCH_AUTHOR_CACHE[videoId] = info;
+    if (info.name || info.url) addDebug("ficha " + videoId + " -> " + (info.name || "?") + " " + (info.url || ""));
+    return info;
+}
+
+function enrichAuthorsFromWatchPage(results) {
+    if (!results || !results.length) return results;
+    let fetched = 0;
+    for (let i = 0; i < results.length && fetched < WATCH_AUTHOR_CAP; i++) {
+        let r = results[i];
+        if (!r || !/^\d{6,}$/.test(safeStr(r.id))) continue;
+        let ai = r.authorInfo || {};
+        if (ai.fromGroup && ai.name && isGroupUrl(ai.url)) continue;
+        fetched++;
+        let info = null;
+        try { info = fetchWatchAuthor(r.id); } catch (e) { addDebug("ficha autor: " + e); }
+        if (!info) continue;
+        if (isGroupUrl(info.url) && info.name && !isJunkName(info.name)) {
+            r.authorInfo = info;
+            try { rememberAuthor(r.id, info); } catch (_) {}
+        }
     }
     return results;
 }
@@ -2369,7 +2563,15 @@ function resolveAuthorInfo(info, videoId, html) {
         let rem = recallAuthor(videoId);
         if (rem) names.push(rem.name);
 
-        if (!info.explicit && html) {
+        let pageGroup = html ? groupCardFromBlock(html) : null;
+        if (pageGroup && pageGroup.id && !pageGroup.name) pageGroup.name = nameNearGroup(html, pageGroup.id);
+        if (pageGroup && isGroupUrl(pageGroup.url)) {
+            info.url = pageGroup.url;
+            info.id = pageGroup.id || info.id;
+            if (pageGroup.name && !isJunkName(pageGroup.name)) info.name = pageGroup.name;
+            info.explicit = true;
+            info.fromGroup = true;
+        } else if (!info.explicit && html) {
             let pg = extractAuthorFromVideoPage(html, videoId, names);
             if (pg && pg.url) {
                 info.url = pg.url;
@@ -2378,12 +2580,14 @@ function resolveAuthorInfo(info, videoId, html) {
             }
             mergeAuthorInfo(info, pg);
         }
-        if (rem) {
+        if (rem && !info.fromGroup) {
             if (rem.url && !info.explicit) {
                 info.url = rem.url;
                 if (rem.id) info.id = rem.id;
             }
             mergeAuthorInfo(info, rem);
+        } else if (rem && info.fromGroup && !info.name && rem.name && isGroupUrl(rem.url)) {
+            info.name = rem.name;
         }
         if (!authorComplete(info) && videoId && /^\d+$/.test(safeStr(videoId)) && !AUTHOR_FETCH_TRIED[videoId]) {
             AUTHOR_FETCH_TRIED[videoId] = true;
