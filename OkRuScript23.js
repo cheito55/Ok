@@ -1,5 +1,5 @@
 /*
- * GrayJay - OK.ru Source v41 + búsqueda rápida (1 página)
+ * GrayJay - OK.ru Source v42 + búsqueda como el original
  *
  * Base: OkRuScript_conLogin-Cast.js (v38). Agregado: nombre real del autor en
  * tarjetas y videos + clic en el nombre -> canal con sus videos. Sin traducción.
@@ -1614,11 +1614,24 @@ function makeSearchVideo(r) {
 
     let author = null;
     try {
-        // No usar el usuario de la tarjeta de búsqueda como canal: suele ser
-        // otro (LORENZO J) y no el dueño de la ficha. El clic resuelve el canal.
+        // Igual que el original: no inventar /__author/ en la búsqueda.
+        // Ese enlace hacía que GrayJay pidiera el canal de cada fila y
+        // la lista quedara vacía. Solo se enlaza si la página ya trae perfil/grupo.
         let ai = r.authorInfo || {};
-        if (!ai.fromOwner) ai = { name: ai.name || "", id: "", url: "", thumbnail: "", subscribers: 0 };
-        author = makeAuthorLink(ai, r.id);
+        let url = isChannelLikeUrl(ai.url) && !isPseudoAuthorUrl(ai.url) ? ai.url : "";
+        let name = cleanText(ai.name);
+        if (isJunkName(name)) name = "";
+        if (url) {
+            author = makeAuthorLink({ name: name, id: ai.id, url: url, thumbnail: ai.thumbnail, subscribers: ai.subscribers || 0 }, "");
+        } else {
+            author = new PlatformAuthorLink(
+                new PlatformID(PLATFORM_NAME, "", PLUGIN_ID),
+                name || "OK.ru",
+                "https://ok.ru/",
+                "",
+                0
+            );
+        }
     } catch (_) {}
 
     try {
@@ -1938,7 +1951,8 @@ function pseudoAuthorUrl(videoId) { return "https://ok.ru/__author/" + safeStr(v
 function isPseudoAuthorUrl(u) { return /ok\.ru\/__author\/\d+/i.test(safeStr(u)); }
 
 function isOkChannelUrl(url) {
-    if (isPseudoAuthorUrl(url)) return true;
+    // /__author/ no es canal en la búsqueda: si GrayJay lo resuelve al listar, no hay resultados.
+    if (isPseudoAuthorUrl(url)) return false;
     let u = safeStr(url);
     let pg = u.match(/^(?:https?:\/\/)?(?:www\.|m\.)?ok\.ru\/(?:profile|group)\/([^/?#]+)/i);
     if (pg && badChannelId(pg[1])) return false;
