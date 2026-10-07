@@ -2020,34 +2020,45 @@ function usableAuthorName(n, videoTitle) {
     n = cleanText(n);
     if (!n || n.length < 2 || n.length > 80) return "";
     if (isGenericTitle(n) || /^ok\.ru$/i.test(n) || /^\d+$/.test(n)) return "";
+    if (/^(?:movie|pelicula|película|video|ok)$/i.test(n)) return "";
     if (videoTitle && foldName(n) == foldName(videoTitle)) return "";
     return n;
 }
 
 function extractCardAuthor(block, videoTitle) {
     let out = { name: "", id: "", url: "", thumbnail: "" };
-    block = htmlDecode(safeStr(block)).replace(/\\\//g, "/").replace(/\\u002[fF]/g, "/");
-    if (!block) return out;
+    let src = htmlDecode(safeStr(block)).replace(/\\\//g, "/").replace(/\\u002[fF]/g, "/");
+    if (!src) return out;
 
-    let named = [
-        /(?:authorName|ownerName|uploaderName|groupName|groupTitle|communityName)["']?\s*[:=]\s*["']([^"']{2,80})["']/i,
-        /(?:data-author-name|data-owner-name|data-group-name)\s*=\s*["']([^"']{2,80})["']/i,
-        /class=["'][^"']*(?:ucard[_-]name|author[_-]name|owner[_-]name|video-card_ac|entity-name)[^"']*["'][^>]*>([\s\S]{2,120}?)<\//i
-    ];
-    for (let i = 0; i < named.length; i++) {
-        let mm = block.match(named[i]);
-        if (mm) {
-            let n = usableAuthorName(mm[1], videoTitle);
+    let objm = src.match(/(?:["']?(?:author|owner|uploader|creator|group)["']?\s*:\s*)\{([\s\S]{0,2500})\}/i);
+    let obj = objm ? objm[1] : "";
+    if (obj) {
+        let nmRe = /(?:["']?(?:name|displayName|fullName|userName|username|nickName|title)["']?)\s*:\s*["']([^"']{2,80})["']/ig;
+        let nm;
+        while ((nm = nmRe.exec(obj)) !== null) {
+            let n = usableAuthorName(nm[1], videoTitle);
             if (n) { out.name = n; break; }
         }
+        let um = obj.match(/(?:["']?(?:profile|profileUrl|url|href)["']?)\s*:\s*["']([^"']{5,400})["']/i);
+        if (um) out.url = bareChannelUrl(normalizeUrl(um[1], "https://ok.ru/"));
     }
 
-    let re = /<a\b([^>]*?href\s*=\s*["']([^"']+)["'][^>]*)>([\s\S]{0,200}?)<\/a>/gi;
+    if (!out.name) {
+        let mm = src.match(/(?:authorName|ownerName|uploaderName|groupName|groupTitle|communityName)["']?\s*[:=]\s*["']([^"']{2,80})["']/i);
+        if (mm) out.name = usableAuthorName(mm[1], videoTitle);
+    }
+    if (!out.name) {
+        let mm = src.match(/class=["'][^"']*(?:ucard[_-]name|author[_-]name|owner[_-]name|video-card_ac|entity-name|card_ac)[^"']*["'][^>]*>([\s\S]{2,160}?)<\//i);
+        if (mm) out.name = usableAuthorName(mm[1], videoTitle);
+    }
+
+    let re = /<a\b([^>]*?href\s*=\s*["']([^"']+)["'][^>]*)>([\s\S]{0,180}?)<\/a>/gi;
     let m, best = null, bestD = 1e9;
-    let center = block.indexOf("/video/");
-    if (center < 0) center = Math.floor(block.length / 2);
-    while ((m = re.exec(block)) !== null) {
+    let center = src.indexOf("/video/");
+    if (center < 0) center = Math.floor(src.length / 2);
+    while ((m = re.exec(src)) !== null) {
         if (/\/(?:video|videoembed)\//i.test(m[2])) continue;
+        if (/st\.friendId=|\/guests|\/agreement|\/rtterms|\/help|\/dk\?/i.test(m[2])) continue;
         let ch = channelFromHref(m[2]);
         let text = cleanText(m[3]);
         if (!text) {
@@ -2057,21 +2068,22 @@ function extractCardAuthor(block, videoTitle) {
         text = usableAuthorName(text, videoTitle);
         if (!text) continue;
         let d = Math.abs(m.index - center);
-        if (ch) d -= 500;
+        if (ch) d -= 800;
         if (d < bestD) { bestD = d; best = { name: text, url: ch || "" }; }
     }
     if (best) {
         if (!out.name) out.name = best.name;
-        if (best.url) out.url = best.url;
+        if (!out.url && best.url) out.url = best.url;
     }
-    if (!out.url && out.name) {
-        let gm = block.match(/(?:groupId|groupID)["']?\s*[:=]\s*["']?(\d{6,})/i);
-        if (gm) out.url = "https://ok.ru/group/" + gm[1];
+    if (!out.url) {
+        let gm = src.match(/(?:groupId|groupID)["']?\s*[:=]\s*["']?(\d{6,})/i);
+        if (gm && gm[1] !== "null") out.url = "https://ok.ru/group/" + gm[1];
     }
     if (out.url) {
         let idm = out.url.match(/\/(?:profile|group)\/([^/?#]+)/i) || out.url.match(/ok\.ru\/([^/?#]+)/i);
         if (idm) out.id = idm[1];
     }
+    if (/^ok\.ru$/i.test(out.name)) out.name = "";
     return out;
 }
 
@@ -2141,9 +2153,8 @@ function makeAuthorLink(info, videoId) {
             if (!url) url = bareChannelUrl(rec.url) || (name ? nameChannelUrl(name) : "");
         }
     }
-    // Sin URL vacía: GrayJay muestra Unknown y al tocarlo dice "canal ()".
-    if (!name) name = "OK.ru";
-    if (!url) url = nameChannelUrl(name);
+    // No inventar "OK.ru": eso hacía que todos los videos abrieran el mismo canal.
+    if (!name || !url) return null;
     let id = info.id || name;
     try {
         return new PlatformAuthorLink(
@@ -2223,8 +2234,10 @@ function nameChannelPager(name, page, url) {
     let raw = matched.length ? matched : rest;
     let out = [];
     for (let i = 0; i < raw.length; i++) {
-        if (!raw[i].authorInfo) raw[i].authorInfo = { name: name, url: "", id: "", thumbnail: "" };
-        else if (!raw[i].authorInfo.name) raw[i].authorInfo.name = name;
+        if (name && !/^ok\.ru$/i.test(name)) {
+            if (!raw[i].authorInfo) raw[i].authorInfo = { name: name, url: "", id: "", thumbnail: "" };
+            else if (!raw[i].authorInfo.name) raw[i].authorInfo.name = name;
+        }
         let v = makeSearchVideo(raw[i]);
         if (v) out.push(v);
     }
