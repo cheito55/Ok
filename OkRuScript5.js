@@ -1,5 +1,5 @@
 /*
- * GrayJay - OK.ru Source v40 (Cast + canal clickeable + autores en español)
+ * GrayJay - OK.ru Source v43 (canal con videos + fotos de perfil)
  *
  * Por qué PlayPelis “sí” y aquí a veces “no” (mismos links ok.ru):
  *   PlayPelis pide HTML + master HLS + segmentos en el MISMO proceso HTTP.
@@ -860,7 +860,7 @@ function getAuthorInfo(meta) {
         let profileValue = firstValue(a, ["profile", "profileUrl", "url", "href"]);
         if (safeObj(profileValue)) profileValue = firstValue(profileValue, ["url", "href", "profile"]);
         info.url = normalizeUrl(profileValue, "https://ok.ru/");
-        info.thumbnail = normalizeUrl(firstValue(a, ["thumbnail", "avatar", "avatarUrl", "photo", "photoUrl"]), "https://ok.ru/");
+        info.thumbnail = normalizeUrl(firstValue(a, ["thumbnail", "avatar", "avatarUrl", "photo", "photoUrl", "pic", "picUrl", "pic190x190", "pic128x128", "pic50x50", "picBase", "image", "imageUrl"]), "https://ok.ru/");
         let sub = firstValue(a, ["subscribers", "subscriberCount", "followers", "followersCount"]);
         if (sub) info.subscribers = parseInt(sub, 10) || 0;
     }
@@ -920,7 +920,7 @@ function extractAuthorFromBlock(block) {
     let um = obj.match(/(?:["']?(?:profile|profileUrl|url|href)["']?)\s*:\s*["']([^"']{5,1000})["']/i);
     if (um) out.url = normalizeUrl(um[1], "https://ok.ru/");
 
-    let tm = obj.match(/(?:["']?(?:thumbnail|avatar|avatarUrl|photo|photoUrl)["']?)\s*:\s*["']([^"']{5,1000})["']/i);
+    let tm = obj.match(/(?:["']?(?:thumbnail|avatar|avatarUrl|photo|photoUrl|pic|picUrl|pic190x190|pic128x128|pic50x50|picBase|imageUrl)["']?)\s*:\s*["']([^"']{5,1000})["']/i);
     if (tm) out.thumbnail = normalizeUrl(tm[1], "https://ok.ru/");
 
     let sm = obj.match(/(?:["']?(?:subscribers|subscriberCount|followers|followersCount)["']?)\s*:\s*["']?(\d+)/i);
@@ -1044,6 +1044,194 @@ function prefetchResultAuthors(raw) {
     prefetchSpanishNames(names);
 }
 
+// Rutas de ok.ru que NO son un canal/alias de usuario.
+const OK_RESERVED = /^(?:video|videoembed|videos|search|dk|feed|games|music|live|settings|apphook|profile|group|mobile|help|about|vkp|cdn|market|events|friends|messages|notifications|dkstatic|api|static|web-api|r|st|logout|anonymMain|post|photo|album|topic|statuses|discussions|sports)$/i;
+
+// URL "canónica" del autor/canal: https://ok.ru/profile/<id>, https://ok.ru/group/<id>
+// o https://ok.ru/<alias>, SIN /video ni /video/all. El sufijo se agrega solo
+// al descargar la página, así el enlace del autor, isChannelUrl y
+// PlatformChannel.url coinciden siempre.
+function bareChannelUrl(url) {
+    let u = safeStr(url).trim();
+    let m = u.match(/^(?:https?:\/\/)?(?:www\.|m\.)?ok\.ru\/(profile|group)\/([^\/?#]+)/i);
+    if (m) return "https://ok.ru/" + m[1].toLowerCase() + "/" + m[2];
+    let v = u.match(/^(?:https?:\/\/)?(?:www\.|m\.)?ok\.ru\/([A-Za-z0-9_.-]{2,})(?:\/video(?:\/all)?)?\/?(?:[?#].*)?$/i);
+    if (v && !OK_RESERVED.test(v[1])) return "https://ok.ru/" + v[1];
+    return u;
+}
+
+// Nombres de canal ya vistos en enlaces de autor (más fiables que el <title>
+// de la página de videos del canal, que suele ser genérico).
+const CHANNEL_NAMES = {};
+const CHANNEL_ORIG_NAMES = {};   // nombre original (sin traducir), para buscar
+const CHANNEL_AVATARS = {};      // foto de perfil/canal por URL canónica
+
+function validImageUrl(u) {
+    u = safeStr(u);
+    return /^(?:https?:)?\/\//i.test(u) && !/^data:/i.test(u);
+}
+
+// Foto de perfil junto al enlace del autor en el HTML del video.
+function findAvatarNearLink(html, url) {
+    let m = safeStr(url).match(/\/(profile|group)\/([^\/?#]+)/i);
+    if (!m) return "";
+    let esc = m[2].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    try {
+        let re = new RegExp("<a[^>]+href=[\"'][^\"']*/" + m[1] + "/" + esc + "[^\"']*[\"'][\\s\\S]{0,700}?<img[^>]+(?:src|data-src)=[\"']([^\"']+)[\"']", "i");
+        let mm = safeStr(html).match(re);
+        if (mm) {
+            let u = normalizeUrl(mm[1], "https://ok.ru/");
+            if (validImageUrl(u)) return u;
+        }
+    } catch (_) {}
+    return "";
+}
+
+// Autor visto en la búsqueda, por id de video, para completar el detalle si
+// la página del reproductor no trae el perfil.
+let AUTHOR_CACHE = {};
+let AUTHOR_CACHE_COUNT = 0;
+
+function emptyAuthor() {
+    return { name: "", id: "", url: "", thumbnail: "", subscribers: 0 };
+}
+
+function authorComplete(a) {
+    return !!(a && a.name && a.url);
+}
+
+function mergeAuthorInfo(a, b) {
+    a = a || emptyAuthor();
+    if (!b) return a;
+    if (!a.name && b.name) a.name = b.name;
+    if (!a.url && b.url) { a.url = b.url; if (b.id) a.id = b.id; }
+    if (!a.id && b.id) a.id = b.id;
+    if (!a.thumbnail && b.thumbnail) a.thumbnail = b.thumbnail;
+    if (!a.subscribers && b.subscribers) a.subscribers = b.subscribers;
+    return a;
+}
+
+function rememberAuthor(videoId, info) {
+    try {
+        videoId = safeStr(videoId);
+        if (!videoId || !info || !info.name) return;
+        if (AUTHOR_CACHE_COUNT > 400) { AUTHOR_CACHE = {}; AUTHOR_CACHE_COUNT = 0; }
+        if (!(videoId in AUTHOR_CACHE)) AUTHOR_CACHE_COUNT++;
+        AUTHOR_CACHE[videoId] = info;
+    } catch (_) {}
+}
+
+function recallAuthor(videoId) {
+    videoId = safeStr(videoId);
+    return videoId && AUTHOR_CACHE[videoId] ? AUTHOR_CACHE[videoId] : null;
+}
+
+function isChannelLikeUrl(u) {
+    u = safeStr(u);
+    return /ok\.ru\/(?:profile|group)\/[^\/?#]+/i.test(u) || (isOkChannelUrl(u) && !/ok\.ru\/?$/i.test(u));
+}
+
+// Busca el autor en la página del video (JSON-LD, microdatos y, como último
+// recurso, la ventana de HTML alrededor del id del video).
+function extractAuthorFromVideoPage(html, videoId) {
+    let out = emptyAuthor();
+    html = safeStr(html);
+    if (!html) return out;
+
+    // 1) JSON-LD (schema.org VideoObject)
+    try {
+        let re = /<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi;
+        let m;
+        while ((m = re.exec(html)) !== null) {
+            let j = tryParseJson(m[1]);
+            let arr = (j && j.length !== undefined && typeof j !== "string") ? j : [j];
+            for (let i = 0; i < arr.length; i++) {
+                let o = arr[i];
+                if (!o) continue;
+                let a = o.author || o.creator || o.publisher;
+                if (a && a.length !== undefined && typeof a !== "string") a = a[0];
+                if (a && typeof a === "object") {
+                    let nm = cleanText(a.name);
+                    let url = normalizeUrl(a.url || a["@id"] || "", "https://ok.ru/");
+                    if (nm) out.name = nm;
+                    if (isChannelLikeUrl(url)) out.url = url;
+                    if (authorComplete(out)) return out;
+                }
+            }
+        }
+    } catch (_) {}
+
+    // 2) Microdatos itemprop="author"
+    try {
+        let m = html.match(/itemprop\s*=\s*["'](?:author|creator)["'][\s\S]{0,900}/i);
+        if (m) {
+            let blk = m[0];
+            let hm = blk.match(/href\s*=\s*["']((?:https?:\/\/(?:www\.|m\.)?ok\.ru)?\/(?:profile|group)\/[^"'#?]+)/i);
+            if (hm && !out.url) out.url = normalizeUrl(hm[1], "https://ok.ru/");
+            let nm = blk.match(/itemprop\s*=\s*["']name["'][^>]*content\s*=\s*["']([^"']{2,300})["']/i) ||
+                     blk.match(/content\s*=\s*["']([^"']{2,300})["'][^>]*itemprop\s*=\s*["']name["']/i) ||
+                     blk.match(/itemprop\s*=\s*["']name["'][^>]*>([^<]{2,300})</i);
+            if (nm && !out.name) out.name = cleanText(nm[1]);
+            if (authorComplete(out)) return out;
+        }
+    } catch (_) {}
+
+    // 3) Ventana alrededor del id del video (extractor ya existente).
+    try {
+        if (videoId) {
+            let w = extractAuthorForVideoInHtml(html, videoId);
+            if (w) mergeAuthorInfo(out, w);
+        }
+    } catch (_) {}
+
+    if (out.url && !isChannelLikeUrl(out.url)) out.url = "";
+    return out;
+}
+
+// Completa la identidad del autor desde varias fuentes. El reproductor
+// (/videoembed/<id>) muchas veces trae el nombre pero no el perfil; entonces
+// se usa lo visto en la búsqueda y, si hace falta, la página completa del video.
+let AUTHOR_FETCH_TRIED = {};
+
+function resolveAuthorInfo(info, videoId, html) {
+    info = mergeAuthorInfo(emptyAuthor(), info);
+    let src = "meta";
+    try {
+        if (!authorComplete(info)) {
+            let rem = recallAuthor(videoId);
+            if (rem) { mergeAuthorInfo(info, rem); src += "+busqueda"; }
+        }
+        if (!authorComplete(info) && html) {
+            mergeAuthorInfo(info, extractAuthorFromVideoPage(html, videoId));
+            src += "+html";
+        }
+        if (!authorComplete(info) && videoId && /^\d+$/.test(safeStr(videoId)) && !AUTHOR_FETCH_TRIED[videoId]) {
+            AUTHOR_FETCH_TRIED[videoId] = true;
+            let full = httpGet("https://ok.ru/video/" + videoId, { "Referer": "https://ok.ru/" });
+            if (!full) full = httpGetAuthenticated("https://ok.ru/video/" + videoId);
+            if (full) {
+                try {
+                    let fm = extractMetadataFromHtml(full);
+                    if (fm) mergeAuthorInfo(info, getAuthorInfo(fm));
+                } catch (_) {}
+                if (!authorComplete(info)) mergeAuthorInfo(info, extractAuthorFromVideoPage(full, videoId));
+                src += "+pagina";
+            }
+        }
+    } catch (e) {
+        addDebug("resolveAuthorInfo: " + e);
+    }
+    try {
+        if (!info.thumbnail && info.url) {
+            let bu = bareChannelUrl(info.url);
+            if (CHANNEL_AVATARS[bu]) info.thumbnail = CHANNEL_AVATARS[bu];
+            else if (html) info.thumbnail = findAvatarNearLink(html, info.url);
+        }
+    } catch (_) {}
+    addDebug("author [" + src + "] name=" + info.name + " id=" + info.id + " url=" + info.url + " foto=" + (info.thumbnail ? "si" : "no"));
+    return info;
+}
+
 function makeAuthorLink(info) {
     info = info || {};
     let name = toSpanishName(info.name);
@@ -1055,22 +1243,34 @@ function makeAuthorLink(info) {
         if (m) id = m[1];
     }
 
-    // Cuando OK.ru entrega nombre + ID pero no profile URL, el ID permite
-    // crear un enlace real al perfil/videos. Esto evita que GrayJay muestre
-    // "Unknown" por recibir author=null.
-    if (!url && id) {
-        url = "https://ok.ru/profile/" + encodeURIComponent(id) + "/video";
+    // Nombre + ID sin URL: el ID permite crear un enlace real al perfil
+    // (si en realidad es un grupo, getChannel prueba también /group/<id>).
+    if (!url && id) url = "https://ok.ru/profile/" + encodeURIComponent(id);
+
+    if (url) url = bareChannelUrl(url);
+
+    // Hay enlace pero no nombre: mejor mostrar "OK.ru" clickeable que "Unknown".
+    if (!name && url) name = "OK.ru";
+    if (!name) return null;
+
+    if (!id) {
+        let m2 = url.match(/ok\.ru\/(?:(?:profile|group)\/)?([^/?#]+)/i);
+        id = m2 ? m2[1] : name;
     }
 
-    if (!name || !url) return null;
-    if (!id) id = name;
+    if (url && name !== "OK.ru") {
+        CHANNEL_NAMES[url] = name;
+        let orig = cleanText(info.name);
+        if (orig) CHANNEL_ORIG_NAMES[url] = orig;
+    }
+    let thumb = validImageUrl(info.thumbnail) ? safeStr(info.thumbnail) : (url && CHANNEL_AVATARS[url]) || "";
 
     try {
         return new PlatformAuthorLink(
             new PlatformID(PLATFORM_NAME, id, PLUGIN_ID),
             name,
             url,
-            safeStr(info.thumbnail),
+            thumb,
             info.subscribers || 0
         );
     } catch (_) {
@@ -1453,6 +1653,7 @@ function buildVideoDetails(meta, pageUrl, fallbackTitle, html) {
     let poster = normalizeUrl(getPoster(meta), pageUrl);
     let duration = getDuration(meta);
     let authorInfo = getAuthorInfo(meta);
+    authorInfo = resolveAuthorInfo(authorInfo, extractVideoId(pageUrl), html);
     let authorName = authorInfo.name || "OK.ru";
 
     let hls = [];
@@ -1912,6 +2113,8 @@ function makeSearchVideo(r) {
     try { thumbnails = new Thumbnails(thumbs); }
     catch (_) { thumbnails = new Thumbnails([]); }
 
+    try { rememberAuthor(r.id, r.authorInfo); } catch (_) {}
+
     let author = null;
     try {
         // El extractor de búsqueda guarda authorInfo en r cuando OK.ru lo
@@ -2143,7 +2346,10 @@ const REGEX_CHANNEL_URL = /https?:\/\/(?:www\.|m\.)?ok\.ru\/(?:profile\/[^/?#]+(
 
 function isOkChannelUrl(url) {
     let u = safeStr(url);
-    return /^(?:https?:\/\/)?(?:www\.|m\.)?ok\.ru\/(?:profile\/[^/?#]+(?:\/video)?|group\/[^/?#]+(?:\/video(?:\/all)?(?:[?#].*)?)?)(?:[?#].*)?$/i.test(u);
+    if (/^(?:https?:\/\/)?(?:www\.|m\.)?ok\.ru\/(?:profile\/[^/?#]+(?:\/video)?|group\/[^/?#]+(?:\/video(?:\/all)?(?:[?#].*)?)?)(?:[?#].*)?$/i.test(u)) return true;
+    // Alias de usuario: https://ok.ru/<alias> (excluye rutas reservadas del sitio).
+    let v = u.match(/^(?:https?:\/\/)?(?:www\.|m\.)?ok\.ru\/([A-Za-z0-9_.-]{2,})(?:\/video(?:\/all)?)?\/?(?:[?#].*)?$/i);
+    return !!v && !OK_RESERVED.test(v[1]);
 }
 
 function normalizeChannelUrl(url) {
@@ -2183,10 +2389,23 @@ function extractChannelName(html, url) {
 }
 
 function extractChannelThumbnail(html) {
-    let m = safeStr(html).match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
-    if (m) return normalizeUrl(m[1], "https://ok.ru/");
-    m = safeStr(html).match(/<img[^>]+(?:class|data-l)[^>]*(?:avatar|profile|group)[^>]+(?:src|data-src)=["']([^"']+)["']/i);
-    return m ? normalizeUrl(m[1], "https://ok.ru/") : "";
+    html = safeStr(html);
+    let pats = [
+        /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+        /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+        /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i,
+        /["'](?:avatarUrl|avatar|pic190x190|pic128x128|pic50x50|picBase)["']\s*:\s*["']([^"']+)["']/i,
+        /<img[^>]+(?:class|data-l)[^>]*(?:avatar|profile|group)[^>]+(?:src|data-src)=["']([^"']+)["']/i
+    ];
+    for (let i = 0; i < pats.length; i++) {
+        let m = html.match(pats[i]);
+        if (m) {
+            let u = normalizeUrl(m[1], "https://ok.ru/");
+            if (validImageUrl(u)) return u;
+        }
+    }
+    return "";
 }
 
 function extractChannelDescription(html) {
@@ -2194,32 +2413,224 @@ function extractChannelDescription(html) {
     return m ? cleanText(m[1]) : "";
 }
 
+const CHANNEL_RESOLVED = {};
+
+// Videos de una página de canal: primero el extractor normal; si no hay nada,
+// se decodifica el HTML (JSON escapado / entidades) y se buscan IDs de video
+// en claves habituales de OK.ru (movieId, mvId, videoId) y rutas /video/<id>.
+function collectChannelVideos(html) {
+    html = safeStr(html);
+    let raw = [];
+    let seen = {};
+
+    function take(found) {
+        for (let i = 0; i < found.length; i++) {
+            if (!seen[found[i].id]) { seen[found[i].id] = true; raw.push(found[i]); }
+        }
+    }
+
+    try { take(extractSearchResults(html)); } catch (e) { addDebug("canal extract: " + e); }
+    if (raw.length) return raw;
+
+    let dec = html;
+    try { dec = htmlDecode(html).replace(/\\\//g, "/"); } catch (_) {}
+    try { take(extractSearchResults(dec)); } catch (e) { addDebug("canal extract dec: " + e); }
+    if (raw.length) { addDebug("canal: videos tras decodificar HTML=" + raw.length); return raw; }
+
+    let pats = [
+        /(?:movieId|mvId|videoId|movie_id)["']?\s*[:=]\s*["']?(\d{6,})/gi,
+        /st\.mvId=(\d{6,})/g,
+        /\/video\/(\d{6,})/g
+    ];
+    let idSeen = {};
+    let hits = [];
+    for (let p = 0; p < pats.length; p++) {
+        let m;
+        while ((m = pats[p].exec(dec)) !== null && hits.length < 96) {
+            if (!idSeen[m[1]]) { idSeen[m[1]] = true; hits.push({ id: m[1], index: m.index }); }
+        }
+    }
+
+    let results = [];
+    let seen2 = {};
+    for (let i = 0; i < hits.length; i++) {
+        let h = hits[i];
+        let win = dec.substring(Math.max(0, h.index - 600), Math.min(dec.length, h.index + 900));
+        addSearchCandidate(results, seen2, h.id, win, "");
+        let r = results[results.length - 1];
+        if (r && r.id === h.id && /^OK\.ru video\b/i.test(r.title)) {
+            let after = dec.substring(h.index, Math.min(dec.length, h.index + 600));
+            let before = dec.substring(Math.max(0, h.index - 300), h.index);
+            let jm = after.match(/["']title["']\s*:\s*["']([^"']{2,300})["']/i);
+            if (!jm) {
+                let all = before.match(/["']title["']\s*:\s*["']([^"']{2,300})["']/gi);
+                if (all && all.length) jm = all[all.length - 1].match(/["']title["']\s*:\s*["']([^"']{2,300})["']/i);
+            }
+            if (jm) {
+                let t = cleanText(jm[1]);
+                if (t && !isGenericTitle(t)) {
+                    r.title = t;
+                    r.url = "https://ok.ru/video/" + h.id + "?t=" + encodeURIComponent(t);
+                }
+            }
+        }
+    }
+
+    if (!results.length) {
+        let t = extractPageTitle(html) || "";
+        let n1 = (dec.match(/\/video\/\d+/g) || []).length;
+        let n2 = (dec.match(/movieId|mvId|videoId/gi) || []).length;
+        addDebug("canal sin videos: len=" + dec.length + " title=" + t + " refs/video=" + n1 + " claves=" + n2);
+        addDebug("inicio: " + cleanText(dec.substring(0, 400)).substring(0, 240));
+    } else {
+        addDebug("canal: videos por IDs=" + results.length);
+    }
+    return results;
+}
+
+// Último recurso: buscar el nombre del canal en el buscador de OK.ru y
+// quedarse solo con los resultados cuyo autor es este canal.
+function channelSearchFallback(bare, ident, page) {
+    let name = ident && ident.name ? ident.name : "";
+    if (!name || isGenericSiteTitle(name)) return [];
+    let id = (bare.match(/ok\.ru\/(?:(?:profile|group)\/)?([^\/?#]+)/i) || [])[1] || "";
+    let sh = fetchSearchPage(name, page);
+    if (!sh) return [];
+    let found = extractSearchResults(sh);
+    let out = [];
+    for (let i = 0; i < found.length; i++) {
+        let ai = found[i].authorInfo || {};
+        let au = safeStr(ai.url);
+        if (id && (safeStr(ai.id) === id || au.indexOf("/" + id) >= 0)) out.push(found[i]);
+    }
+    addDebug("canal: respaldo por buscador '" + name + "' => " + out.length + " de " + found.length);
+    return out;
+}
+
+function channelIdentity(bare, html) {
+    let name = CHANNEL_ORIG_NAMES[bare] || "";
+    if (!name && html) {
+        let n = extractChannelName(html, bare);
+        if (n && !isGenericSiteTitle(n)) name = n;
+    }
+    let thumb = CHANNEL_AVATARS[bare] || "";
+    if (!thumb && html) {
+        thumb = extractChannelThumbnail(html);
+        if (thumb) CHANNEL_AVATARS[bare] = thumb;
+    }
+    let idm = bare.match(/ok\.ru\/(?:(?:profile|group)\/)?([^\/?#]+)/i);
+    return { name: name, id: idm ? idm[1] : "", url: bare, thumbnail: thumb, subscribers: 0 };
+}
+
+function channelCandidates(base) {
+    let m = base.match(/ok\.ru\/(profile|group)\/([^\/?#]+)/i);
+    if (m) {
+        let id = m[2];
+        let p = "https://ok.ru/profile/" + id;
+        let g = "https://ok.ru/group/" + id;
+        let pc = [p + "/video", p, "https://m.ok.ru/profile/" + id + "/video"];
+        let gc = [g + "/video/all", g + "/video", g, "https://m.ok.ru/group/" + id + "/video"];
+        return m[1].toLowerCase() === "group" ? gc.concat(pc) : pc.concat(gc);
+    }
+    return [base + "/video", base];
+}
+
+function channelHtmlLooksValid(html) {
+    html = safeStr(html);
+    if (html.length < 500) return false;
+    let t = extractPageTitle(html);
+    if (!t) return false;
+    return !/not\s+found|не\s+найден|не\s+существует|404|doesn.t\s+exist|unavailable|недоступ/i.test(t);
+}
+
+// OK.ru usa /profile/<id> para personas y /group/<id> para comunidades, y el
+// reproductor no siempre dice cuál es. Se prueban las variantes hasta que una
+// devuelva contenido, y se recuerda cuál funcionó.
+function resolveChannel(url) {
+    let base = bareChannelUrl(url) || safeStr(url);
+    if (CHANNEL_RESOLVED[base]) return CHANNEL_RESOLVED[base];
+
+    let cands = channelCandidates(base);
+    let weak = null;
+    let anyHtml = null;
+
+    for (let i = 0; i < cands.length; i++) {
+        let html = "";
+        try { html = httpGetAuthenticated(cands[i]); } catch (e) { addDebug("channel fetch: " + e); }
+        let n = 0;
+        if (html) {
+            try { n = collectChannelVideos(html).length; } catch (_) {}
+        }
+        addDebug("channel try " + cands[i] + " bytes=" + (html ? html.length : 0) + " videos=" + n);
+        if (!html) continue;
+
+        let res = { fetchUrl: cands[i], bare: bareChannelUrl(cands[i]), html: html };
+        if (!anyHtml) anyHtml = res;
+        if (n > 0) {
+            CHANNEL_RESOLVED[base] = res;
+            CHANNEL_RESOLVED[res.bare] = res;
+            return res;
+        }
+        if (!weak && channelHtmlLooksValid(html)) weak = res;
+    }
+
+    let chosen = weak || anyHtml;
+    if (chosen) {
+        CHANNEL_RESOLVED[base] = chosen;
+        CHANNEL_RESOLVED[chosen.bare] = chosen;
+    }
+    return chosen;
+}
+
 function fetchChannelPage(url, page) {
-    let base = normalizeChannelUrl(url);
-    if (!base) return "";
+    let res = resolveChannel(url);
+    if (!res) return "";
 
-    // En perfiles/grupos la paginación de OK.ru suele aceptar st.page.
-    // Para grupos mantenemos /video/all como endpoint de contenido.
-    let target = base;
-    if (page > 1) target += (target.indexOf("?") >= 0 ? "&" : "?") + "st.page=" + page;
+    if (page <= 1) {
+        if (res.html) {
+            let h = res.html;
+            res.html = "";
+            return h;
+        }
+        return httpGetAuthenticated(res.fetchUrl) || "";
+    }
 
+    let target = res.fetchUrl + (res.fetchUrl.indexOf("?") >= 0 ? "&" : "?") + "st.page=" + page;
     let html = httpGetAuthenticated(target);
     addDebug("channel page " + page + " bytes=" + (html ? html.length : 0) + " url=" + target);
     return html || "";
 }
 
 function channelPager(url, page) {
+    if (page <= 1) resetDebug();
+    let res = resolveChannel(url);
+    let bare = res ? res.bare : bareChannelUrl(url);
     let html = fetchChannelPage(url, page);
-    if (!html) throw new Error("OK.ru channel returned no data");
 
-    let found = extractSearchResults(html);
-    let raw = [];
-    let seen = {};
-    for (let i = 0; i < found.length; i++) {
-        if (!seen[found[i].id]) {
-            seen[found[i].id] = true;
-            raw.push(found[i]);
-        }
+    let raw = html ? collectChannelVideos(html) : [];
+    let ident = channelIdentity(bare, page <= 1 ? html : "");
+
+    if (!raw.length) {
+        try { raw = channelSearchFallback(bare, ident, page); }
+        catch (e) { addDebug("canal respaldo: " + e); raw = []; }
+    }
+
+    if (!raw.length) {
+        if (page <= 1) throw new Error("El canal de OK.ru no devolvió videos (" + bare + ")\n" + debugText());
+        return new OkChannelVideoPager([], false, { url: url, page: page + 1 });
+    }
+
+    // Todos los videos de esta página pertenecen al canal: usar su identidad
+    // (nombre + enlace + foto) en lugar de adivinarla por tarjeta.
+    for (let i = 0; i < raw.length; i++) {
+        let ai = raw[i].authorInfo || {};
+        raw[i].authorInfo = {
+            name: ident.name || ai.name || "",
+            id: ident.id || ai.id || "",
+            url: ident.url,
+            thumbnail: ident.thumbnail || ai.thumbnail || "",
+            subscribers: 0
+        };
     }
 
     prefetchResultAuthors(raw);
@@ -2244,18 +2655,25 @@ class OkChannelVideoPager extends VideoPager {
 }
 
 function getChannelObject(url) {
-    let canonical = normalizeChannelUrl(url);
-    let id = extractChannelId(canonical);
-    let html = "";
-    try { html = fetchChannelPage(canonical, 1); } catch (e) { addDebug("getChannel: " + e); }
+    resetDebug();
+    let res = null;
+    try { res = resolveChannel(url); } catch (e) { addDebug("getChannel: " + e); }
+    if (!res) throw new Error("No se pudo abrir el canal de OK.ru: " + safeStr(url) + "\n" + debugText());
 
-    let name = html ? extractChannelName(html, canonical) : "OK.ru";
-    let thumbnail = html ? extractChannelThumbnail(html) : "";
+    let canonical = res.bare;
+    let id = extractChannelId(canonical) || (canonical.match(/ok\.ru\/([^\/?#]+)/i) || [])[1] || canonical;
+    let html = res.html;
+    if (!html) { try { html = httpGetAuthenticated(res.fetchUrl); } catch (_) { html = ""; } }
+
+    let known = CHANNEL_NAMES[canonical] || CHANNEL_NAMES[bareChannelUrl(url)] || "";
+    let name = known || (html ? extractChannelName(html, canonical) : "OK.ru");
+    let thumbnail = CHANNEL_AVATARS[canonical] || (html ? extractChannelThumbnail(html) : "");
+    if (thumbnail) CHANNEL_AVATARS[canonical] = thumbnail;
     let description = html ? extractChannelDescription(html) : "";
 
     try {
         return new PlatformChannel({
-            id: new PlatformID(PLATFORM_NAME, id || canonical, PLUGIN_ID),
+            id: new PlatformID(PLATFORM_NAME, id, PLUGIN_ID),
             name: toSpanishName(name),
             thumbnail: thumbnail,
             banner: "",
@@ -2266,7 +2684,7 @@ function getChannelObject(url) {
         });
     } catch (e) {
         addDebug("PlatformChannel EXCEPTION: " + e);
-        return null;
+        throw new Error("PlatformChannel: " + e + "\n" + debugText());
     }
 }
 
@@ -2355,19 +2773,26 @@ source.getChannelVideos = function (url, type, order, filters, continuationToken
     return source.getChannelContents(url, type, order, filters, continuationToken);
 };
 
+function okChannelTypes() {
+    try {
+        if (typeof Type !== "undefined" && Type && Type.Feed && Type.Feed.Mixed) return [Type.Feed.Mixed];
+    } catch (_) {}
+    return ["MIXED"];
+}
+
 source.getChannelCapabilities = function () {
     try {
-        return new ResultCapabilities(["video"], [], []);
+        return new ResultCapabilities(okChannelTypes(), [], []);
     } catch (_) {
-        return { types: ["video"], sorts: [], filters: [] };
+        return { types: okChannelTypes(), sorts: [], filters: [] };
     }
 };
 
 source.getSearchChannelContentsCapabilities = function () {
     try {
-        return new ResultCapabilities(["video"], [], []);
+        return new ResultCapabilities(okChannelTypes(), [], []);
     } catch (_) {
-        return { types: ["video"], sorts: [], filters: [] };
+        return { types: okChannelTypes(), sorts: [], filters: [] };
     }
 };
 
