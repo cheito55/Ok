@@ -1557,8 +1557,8 @@ function extractSearchResults(html) {
     let m;
 
     while ((m = re.exec(html)) !== null && results.length < 96) {
-        let start = Math.max(0, m.index - 250);
-        let end = Math.min(html.length, re.lastIndex + 1100);
+        let start = Math.max(0, m.index - 700);
+        let end = Math.min(html.length, re.lastIndex + 1400);
         addSearchCandidate(
             results, seen, m[2],
             html.substring(start, end),
@@ -2016,32 +2016,62 @@ function channelFromHref(href) {
     return bareChannelUrl(normalizeUrl(href, "https://ok.ru/"));
 }
 
+function usableAuthorName(n, videoTitle) {
+    n = cleanText(n);
+    if (!n || n.length < 2 || n.length > 80) return "";
+    if (isGenericTitle(n) || /^ok\.ru$/i.test(n) || /^\d+$/.test(n)) return "";
+    if (videoTitle && foldName(n) == foldName(videoTitle)) return "";
+    return n;
+}
+
 function extractCardAuthor(block, videoTitle) {
     let out = { name: "", id: "", url: "", thumbnail: "" };
-    block = htmlDecode(safeStr(block)).replace(/\\\//g, "/");
+    block = htmlDecode(safeStr(block)).replace(/\\\//g, "/").replace(/\\u002[fF]/g, "/");
     if (!block) return out;
-    let re = /<a\b([^>]*?href\s*=\s*["']([^"']+)["'][^>]*)>([\s\S]{0,240}?)<\/a>/gi;
+
+    let named = [
+        /(?:authorName|ownerName|uploaderName|groupName|groupTitle|communityName)["']?\s*[:=]\s*["']([^"']{2,80})["']/i,
+        /(?:data-author-name|data-owner-name|data-group-name)\s*=\s*["']([^"']{2,80})["']/i,
+        /class=["'][^"']*(?:ucard[_-]name|author[_-]name|owner[_-]name|video-card_ac|entity-name)[^"']*["'][^>]*>([\s\S]{2,120}?)<\//i
+    ];
+    for (let i = 0; i < named.length; i++) {
+        let mm = block.match(named[i]);
+        if (mm) {
+            let n = usableAuthorName(mm[1], videoTitle);
+            if (n) { out.name = n; break; }
+        }
+    }
+
+    let re = /<a\b([^>]*?href\s*=\s*["']([^"']+)["'][^>]*)>([\s\S]{0,200}?)<\/a>/gi;
     let m, best = null, bestD = 1e9;
     let center = block.indexOf("/video/");
     if (center < 0) center = Math.floor(block.length / 2);
     while ((m = re.exec(block)) !== null) {
+        if (/\/(?:video|videoembed)\//i.test(m[2])) continue;
         let ch = channelFromHref(m[2]);
-        if (!ch) continue;
         let text = cleanText(m[3]);
-        if (!text || isGenericTitle(text)) {
-            let tm = m[1].match(/(?:title|aria-label)\s*=\s*["']([^"']{2,120})["']/i);
+        if (!text) {
+            let tm = m[1].match(/(?:title|aria-label)\s*=\s*["']([^"']{2,80})["']/i);
             if (tm) text = cleanText(tm[1]);
         }
-        if (!text || isGenericTitle(text) || /^ok\.ru$/i.test(text)) continue;
-        if (videoTitle && foldName(text) == foldName(videoTitle)) continue;
+        text = usableAuthorName(text, videoTitle);
+        if (!text) continue;
         let d = Math.abs(m.index - center);
-        if (d < bestD) { bestD = d; best = { name: text, url: ch }; }
+        if (ch) d -= 500;
+        if (d < bestD) { bestD = d; best = { name: text, url: ch || "" }; }
     }
-    if (!best) return out;
-    out.name = best.name;
-    out.url = best.url;
-    let idm = best.url.match(/\/(?:profile|group)\/([^/?#]+)/i) || best.url.match(/ok\.ru\/([^/?#]+)/i);
-    if (idm) out.id = idm[1];
+    if (best) {
+        if (!out.name) out.name = best.name;
+        if (best.url) out.url = best.url;
+    }
+    if (!out.url && out.name) {
+        let gm = block.match(/(?:groupId|groupID)["']?\s*[:=]\s*["']?(\d{6,})/i);
+        if (gm) out.url = "https://ok.ru/group/" + gm[1];
+    }
+    if (out.url) {
+        let idm = out.url.match(/\/(?:profile|group)\/([^/?#]+)/i) || out.url.match(/ok\.ru\/([^/?#]+)/i);
+        if (idm) out.id = idm[1];
+    }
     return out;
 }
 
@@ -2100,30 +2130,32 @@ function authorFromMeta(meta) {
 function makeAuthorLink(info, videoId) {
     info = info || {};
     let name = cleanText(info.name);
-    if (isGenericTitle(name) || /^ok\.ru$/i.test(name)) name = "";
+    if (isGenericTitle(name) || /^ok\.ru$/i.test(name) || /^\d+$/.test(name)) name = "";
     let url = bareChannelUrl(info.url);
     if (!url && name) url = nameChannelUrl(name);
-    if (!url) {
+    if (!name || !url) {
         let rec = recallAuthor(videoId);
         if (rec) {
             if (!name) name = cleanText(rec.name);
-            url = bareChannelUrl(rec.url) || (name ? nameChannelUrl(name) : "");
+            if (isGenericTitle(name)) name = "";
+            if (!url) url = bareChannelUrl(rec.url) || (name ? nameChannelUrl(name) : "");
         }
     }
-    if (!name && !url) return null;
+    // Sin URL vacía: GrayJay muestra Unknown y al tocarlo dice "canal ()".
     if (!name) name = "OK.ru";
-    let id = info.id || videoId || name;
-    let im = safeStr(url).match(/ok\.ru\/(?:__name\/|(?:profile|group)\/)?([^/?#]+)/i);
-    if (im) id = im[1];
+    if (!url) url = nameChannelUrl(name);
+    let id = info.id || name;
     try {
         return new PlatformAuthorLink(
             new PlatformID(PLATFORM_NAME, id, PLUGIN_ID),
             name,
-            url || "https://ok.ru/",
+            url,
             info.thumbnail || "",
             0
         );
-    } catch (_) { return null; }
+    } catch (_) {
+        return null;
+    }
 }
 
 function channelFetchUrl(url) {
