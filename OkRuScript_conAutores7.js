@@ -3544,7 +3544,17 @@ function getChannelObject(url) {
 }
 
 function channelPageFromToken(token) {
-    return asChannelToken(token);
+    if (!token) return { page: 1, nextUrl: null };
+    try {
+        if (typeof token === "object") {
+            return { 
+                page: Math.max(1, Number(token.page) || 1), 
+                nextUrl: token.nextUrl || null 
+            };
+        }
+        return { page: Math.max(1, Number(token) || 1), nextUrl: null };
+    } catch (_) {}
+    return { page: 1, nextUrl: null };
 }
 
 function okChannelTypes() {
