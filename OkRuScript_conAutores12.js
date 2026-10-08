@@ -3835,7 +3835,7 @@ function sortedSeriesPager(url, mode) {
     
     // Comentar esta línea permite que el script recopile y ordene 
     // todos los videos de cualquier canal, aunque no sea un álbum.
-    // if (!/\/video\/c\d+/i.test(u)) return null;
+    if (!/\/video\/c\d+/i.test(u)) return null;
 
     let t0 = nowMs();
     let all = [], seen = {};
