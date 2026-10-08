@@ -3829,9 +3829,13 @@ function chapterSortMode(order) {
 // Devuelve null si no es un canal de serie o si falló la primera página
 // (entonces channelPager normal muestra el error con su diagnóstico).
 function sortedSeriesPager(url, mode) {
+    function sortedSeriesPager(url, mode) {
     let u = "";
     try { u = safeStr(unpseudoChannel(url)); } catch (_) { u = safeStr(url); }
-    if (!/\/video\/c\d+/i.test(u)) return null;
+    
+    // Comentar esta línea permite que el script recopile y ordene 
+    // todos los videos de cualquier canal, aunque no sea un álbum.
+    // if (!/\/video\/c\d+/i.test(u)) return null;
 
     let t0 = nowMs();
     let all = [], seen = {};
