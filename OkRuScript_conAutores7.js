@@ -3377,17 +3377,110 @@ function channelPager(url, tokenObj) {
     }
 
     if (page <= 1 || !CHANNEL_SEEN[key]) CHANNEL_SEEN[key] = {};
-    let fresh = [];
-    for (let i = 0; i < raw.length; i++) {
-        if (!CHANNEL_SEEN[key][raw[i].id]) { CHANNEL_SEEN[key][raw[i].id] = true; fresh.push(raw[i]); }
+
+function channelPager(url, tokenObj) {
+    // Compatibilidad por si tokenObj entra solo como número desde otra parte del código
+    if (typeof tokenObj !== "object") {
+        tokenObj = { page: Math.max(1, Number(tokenObj) || 1), nextUrl: null };
+    }
+    let page = tokenObj.page || 1;
+    
+    if (page <= 1) resetDebug();
+    url = unpseudoChannel(url);
+    if (badChannelId(chanKey(url))) {
+        throw new Error("OK.ru no indica a qué canal pertenece este video (" + safeStr(url) + "). Abre el video y vuelve a probar.");
+    }
+    
+    let res = resolveChannel(url);
+    let bare = res ? res.bare : bareChannelUrl(url);
+    let html = fetchChannelPage(url, tokenObj);
+    let raw = html ? collectChannelVideos(html) : [];
+
+    // --- NUEVO: Buscar la URL de la siguiente página (paginación AJAX de OK.ru) ---
+    let nextUrlExtracted = null;
+    if (html) {
+        // 1. Buscamos SOLO comandos de OK.ru relacionados a listas de canales, grupos o álbumes.
+        let rePagination = /(?:data-url|href)\s*=\s*["'](\/dk\?st\.cmd=[^"']*(?:Channel|Group|User|Profile|Album|List)[^"']*ShowMore[^"']*(?:lastId|direction=next|marker)[^"']*)["']/i;
+        let nextMatch = html.match(rePagination);
+        
+        if (nextMatch) {
+            let candidata = nextMatch[1].replace(/&amp;/g, "&");
+            // Filtro vital: descartar si es el botón de recomendaciones, videos relacionados o feed principal
+            if (!/Recommend|MainShowMore|Related|Similar|Top/i.test(candidata)) {
+                nextUrlExtracted = candidata;
+            }
+        }
+        
+        // 2. Plan B: Si la regex anterior falló, buscamos el bloque específico "Mostrar más" por sus clases HTML
+        if (!nextUrlExtracted) {
+            let blockMatch = html.match(/(?:id=["'][^"']*(?:show-more|loader)[^"']*["']|class=["'][^"']*(?:js-show-more|link-show-more)[^"']*["'])[\s\S]{0,300}?(?:data-url|href)\s*=\s*["'](\/dk\?st\.cmd=[^"']+(?:lastId|direction=next)[^"']*)["']/i);
+            if (blockMatch) {
+                let candidata = blockMatch[1].replace(/&amp;/g, "&");
+                if (!/Recommend|MainShowMore|Related|Similar/i.test(candidata)) {
+                    nextUrlExtracted = candidata;
+                }
+            }
+        }
+    }
+    // -----------------------------------------------------------------------------
+
+    // Identidad del canal
+    let key = chanKey(bare);
+    let name = CHANNEL_NAMES[key] || "";
+    if (!name && html && page <= 1) {
+        let n = extractChannelName(html);
+        if (n && !isGenericSiteTitle(n) && !/^OK\.ru$/i.test(n)) name = n;
+    }
+    let thumb = CHANNEL_AVATARS[key] || "";
+    if (!thumb && html && page <= 1) {
+        thumb = extractChannelThumbnail(html);
+        if (thumb) CHANNEL_AVATARS[key] = thumb;
+    }
+    if (raw.length) {
+        let ai0 = raw[0].authorInfo || {};
+        if (!name && ai0.name && !isJunkName(ai0.name)) name = ai0.name;
+        if (!thumb && ai0.thumbnail) thumb = ai0.thumbnail;
+    }
+    if (name) CHANNEL_NAMES[key] = name;
+
+    // Respaldo: buscar por el nombre del canal y quedarse con sus videos
+    if (!raw.length && name && !isGenericSiteTitle(name)) {
+        try {
+            let id = chanKey(bare);
+            let found = extractSearchResults(fetchSearchPage(name, page));
+            for (let i = 0; i < found.length; i++) {
+                let ai = found[i].authorInfo || {};
+                let sameId = id && (safeStr(ai.id) === id || safeStr(ai.url).indexOf("/" + id) >= 0);
+                let sameName = ai.name && cleanText(ai.name).toLowerCase() === cleanText(name).toLowerCase();
+                if (sameId || sameName) raw.push(found[i]);
+            }
+        } catch (e) { addDebug("canal respaldo: " + e); }
     }
 
-    // Sin videos nuevos y sin enlace al siguiente lote: cortar.
-    if (page > 1 && !fresh.length && !nextUrlExtracted) {
+    if (!raw.length) {
+        if (page <= 1) throw new Error("El canal de OK.ru no devolvió videos (" + bare + ")\n" + debugText());
         return new OkChannelVideoPager([], false, { url: url, page: page + 1, nextUrl: null });
     }
+
+    // Filtrar duplicados
+    if (page <= 1 || !CHANNEL_SEEN[key]) CHANNEL_SEEN[key] = {};
+    let fresh = [];
+    for (let i = 0; i < raw.length; i++) {
+        if (!CHANNEL_SEEN[key][raw[i].id]) { 
+            CHANNEL_SEEN[key][raw[i].id] = true; 
+            fresh.push(raw[i]); 
+        }
+    }
+
+    // PROTECCIÓN CONTRA BUCLES: Si estamos en la página 2 en adelante y no entró 
+    // absolutamente ningún video nuevo, cortamos de inmediato.
+    if (page > 1 && fresh.length === 0) {
+        return new OkChannelVideoPager([], false, { url: url, page: page, nextUrl: null });
+    }
+    
     raw = fresh;
 
+    // Asignar la autoría a los videos procesados
     for (let i = 0; i < raw.length; i++) {
         let ai = raw[i].authorInfo || {};
         raw[i].authorInfo = {
@@ -3399,14 +3492,16 @@ function channelPager(url, tokenObj) {
         };
     }
 
+    // Convertir los resultados al formato esperado por la app
     let out = [];
     for (let i = 0; i < raw.length; i++) {
         let v = makeSearchVideo(raw[i]);
         if (v) out.push(v);
     }
 
-    // Hay más si OK.ru dejó la URL del siguiente lote, o si esta página trajo videos nuevos.
-    let hasMore = (nextUrlExtracted !== null) || (raw.length > 0);
+    // Hay más páginas ÚNICAMENTE si logramos extraer la URL de "Mostrar más" de OK.ru.
+    let hasMore = (nextUrlExtracted !== null);
+    
     return new OkChannelVideoPager(out, hasMore, {
         url: url,
         page: page + 1,
